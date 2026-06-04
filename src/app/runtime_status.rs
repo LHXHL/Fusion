@@ -64,7 +64,11 @@ pub fn runtime_status_snapshot_path(data_dir: &PathBuf) -> PathBuf {
     data_dir.join("runtime-status.json")
 }
 
-pub fn relay_link_key(transport: &str, source_peer_agent_id: &str, source_stream_id: u32) -> String {
+pub fn relay_link_key(
+    transport: &str,
+    source_peer_agent_id: &str,
+    source_stream_id: u32,
+) -> String {
     format!("{transport}:{source_peer_agent_id}:{source_stream_id}")
 }
 
@@ -97,10 +101,11 @@ pub async fn remove_relay_link(
     source_peer_agent_id: &str,
     source_stream_id: u32,
 ) {
-    relay_links
-        .lock()
-        .await
-        .remove(&relay_link_key(transport, source_peer_agent_id, source_stream_id));
+    relay_links.lock().await.remove(&relay_link_key(
+        transport,
+        source_peer_agent_id,
+        source_stream_id,
+    ));
 }
 
 pub async fn write_status_snapshot(
@@ -167,7 +172,10 @@ pub async fn write_status_snapshot(
 }
 
 pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope) -> Vec<String> {
-    let mut lines = vec![format!("status.generated_at={}", snapshot.generated_at_unix)];
+    let mut lines = vec![format!(
+        "status.generated_at={}",
+        snapshot.generated_at_unix
+    )];
     match scope {
         StatusScope::All => {
             lines.push(format!("session.count={}", snapshot.sessions.len()));
@@ -189,11 +197,18 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
             }
             lines.push(format!("registry.route_count={}", snapshot.routes.len()));
             for route in &snapshot.routes {
+                let path = route
+                    .path
+                    .iter()
+                    .map(|hop| hop.agent_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} services={} capabilities={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_at={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
+                    path,
                     route.services.join(","),
                     route.capabilities.join(","),
                     route.learned_at_unix
@@ -246,11 +261,18 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
         StatusScope::Routes => {
             lines.push(format!("registry.route_count={}", snapshot.routes.len()));
             for route in &snapshot.routes {
+                let path = route
+                    .path
+                    .iter()
+                    .map(|hop| hop.agent_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} services={} capabilities={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_at={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
+                    path,
                     route.services.join(","),
                     route.capabilities.join(","),
                     route.learned_at_unix
@@ -288,7 +310,10 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
 }
 
 fn render_services_lines(snapshot: &RuntimeStatusSnapshot) -> Vec<String> {
-    let mut lines = vec![format!("status.generated_at={}", snapshot.generated_at_unix)];
+    let mut lines = vec![format!(
+        "status.generated_at={}",
+        snapshot.generated_at_unix
+    )];
     lines.push(format!(
         "service.exposed_count={}",
         snapshot.local_services.len()
@@ -297,7 +322,11 @@ fn render_services_lines(snapshot: &RuntimeStatusSnapshot) -> Vec<String> {
         lines.push(service.clone());
     }
 
-    let remote_count: usize = snapshot.routes.iter().map(|route| route.services.len()).sum();
+    let remote_count: usize = snapshot
+        .routes
+        .iter()
+        .map(|route| route.services.len())
+        .sum();
     lines.push(format!("service.remote_count={remote_count}"));
     for route in &snapshot.routes {
         for service in &route.services {
@@ -336,7 +365,11 @@ pub async fn print_status_snapshot(
     let payload = tokio::fs::read(&path).await.map_err(|err| {
         Error::new(
             err.kind(),
-            format!("failed to read runtime status snapshot {}: {}", path.display(), err),
+            format!(
+                "failed to read runtime status snapshot {}: {}",
+                path.display(),
+                err
+            ),
         )
     })?;
     let snapshot: RuntimeStatusSnapshot = serde_json::from_slice(&payload)
@@ -391,7 +424,11 @@ pub async fn print_control_snapshot(
     let payload = tokio::fs::read(&path).await.map_err(|err| {
         Error::new(
             err.kind(),
-            format!("failed to read runtime status snapshot {}: {}", path.display(), err),
+            format!(
+                "failed to read runtime status snapshot {}: {}",
+                path.display(),
+                err
+            ),
         )
     })?;
     let snapshot: RuntimeStatusSnapshot = serde_json::from_slice(&payload)
@@ -482,11 +519,18 @@ pub async fn print_control_snapshot(
                 }
                 println!("peer.route_count={}", routes.len());
                 for route in routes {
+                    let path = route
+                        .path
+                        .iter()
+                        .map(|hop| hop.agent_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(">");
                     println!(
-                        "peer.route={} next_hop={} hops={} services={}",
+                        "peer.route={} next_hop={} hops={} path={} services={}",
                         route.destination_agent_id,
                         route.next_hop_agent_id,
                         route.hop_count,
+                        path,
                         route.services.join(",")
                     );
                 }
@@ -531,6 +575,7 @@ pub async fn print_control_snapshot(
                             "owner_agent_name": route.destination_agent_name,
                             "next_hop_agent_id": route.next_hop_agent_id,
                             "hop_count": route.hop_count,
+                            "path": route.path,
                             "services": route.services,
                         })).collect::<Vec<_>>(),
                     }))

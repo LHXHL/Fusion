@@ -1,14 +1,11 @@
 use std::io::{Error, ErrorKind};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    crypto::aead::{open, seal, EncMessage},
+    crypto::wrapper::{payload_looks_wrapped, WrapperPipeline},
     protocol::{codec, frame::Frame},
 };
-
-const ENCRYPTED_FRAME_MAGIC: &[u8] = b"FXE1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedKey([u8; 32]);
@@ -26,78 +23,27 @@ impl SharedKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct SealedTransportFrame {
-    nonce: String,
-    ciphertext: String,
-}
-
-pub fn encode_transport_frame(frame: &Frame, shared_key: Option<&SharedKey>) -> Result<Vec<u8>, Error> {
+pub fn encode_transport_frame(
+    frame: &Frame,
+    shared_key: Option<&SharedKey>,
+) -> Result<Vec<u8>, Error> {
     let plain = codec::encode_frame(frame)?;
-    match shared_key {
-        None => Ok(plain),
-        Some(shared_key) => {
-            let sealed = seal(&plain, shared_key.as_bytes()).map_err(|err| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    format!("failed to encrypt transport frame: {err}"),
-                )
-            })?;
-            let envelope = SealedTransportFrame {
-                nonce: sealed.nonce,
-                ciphertext: sealed.ciphertext,
-            };
-            let body = serde_json::to_vec(&envelope)
-                .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
-            let mut out = Vec::with_capacity(ENCRYPTED_FRAME_MAGIC.len() + body.len());
-            out.extend_from_slice(ENCRYPTED_FRAME_MAGIC);
-            out.extend_from_slice(&body);
-            Ok(out)
-        }
-    }
+    WrapperPipeline::from_shared_key(shared_key).wrap(plain)
 }
 
-pub fn decode_transport_frame(bytes: &[u8], shared_key: Option<&SharedKey>) -> Result<Frame, Error> {
-    match shared_key {
-        None => {
-            if bytes.starts_with(ENCRYPTED_FRAME_MAGIC) {
-                return Err(Error::new(
-                    ErrorKind::PermissionDenied,
-                    "received encrypted transport frame but local key is not configured",
-                ));
-            }
-            codec::decode_frame(bytes)
-        }
-        Some(shared_key) => {
-            if !bytes.starts_with(ENCRYPTED_FRAME_MAGIC) {
-                return Err(Error::new(
-                    ErrorKind::PermissionDenied,
-                    "received unencrypted transport frame but local key is configured",
-                ));
-            }
-            let envelope: SealedTransportFrame = serde_json::from_slice(&bytes[ENCRYPTED_FRAME_MAGIC.len()..])
-                .map_err(|err| {
-                    Error::new(
-                        ErrorKind::InvalidData,
-                        format!("failed to decode encrypted transport envelope: {err}"),
-                    )
-                })?;
-            let plain = open(
-                &EncMessage {
-                    nonce: envelope.nonce,
-                    ciphertext: envelope.ciphertext,
-                },
-                shared_key.as_bytes(),
-            )
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::PermissionDenied,
-                    format!("failed to decrypt transport frame: {err}"),
-                )
-            })?;
-            codec::decode_frame(&plain)
-        }
+pub fn decode_transport_frame(
+    bytes: &[u8],
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error> {
+    let pipeline = WrapperPipeline::from_shared_key(shared_key);
+    if !pipeline.requires_wrapped_input() && payload_looks_wrapped(bytes) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "received wrapped transport frame but no local wrapper is configured",
+        ));
     }
+    let plain = pipeline.unwrap(bytes)?;
+    codec::decode_frame(&plain)
 }
 
 #[cfg(test)]

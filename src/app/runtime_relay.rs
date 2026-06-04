@@ -7,7 +7,10 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::{
-    agent::{identity::AgentIdentity, registry::{AgentRegistry, RegisteredRoute}},
+    agent::{
+        identity::AgentIdentity,
+        registry::{AgentRegistry, RegisteredRoute},
+    },
     app::runtime_status::{remove_relay_link, upsert_relay_link, RelayLinkMap},
     protocol::{
         frame::{Frame, MessageType},
@@ -66,6 +69,7 @@ pub async fn send_direct_announce_ws_mux(
 
 pub fn handle_registry_control_message(
     registry: &mut AgentRegistry,
+    local_agent_id: &str,
     peer_agent_id: &str,
     message: &Message,
 ) -> bool {
@@ -80,6 +84,15 @@ pub fn handle_registry_control_message(
         }
         Message::RouteUpdate(update) => {
             for announcement in &update.announcements {
+                if let Err(reason) =
+                    validate_route_announcement(local_agent_id, peer_agent_id, announcement)
+                {
+                    eprintln!(
+                        "registry.route_rejected origin={} source_peer={} reason={}",
+                        announcement.origin_agent_id, peer_agent_id, reason
+                    );
+                    continue;
+                }
                 registry.upsert_route_announcement(announcement);
             }
             true
@@ -125,10 +138,7 @@ pub async fn send_route_snapshot_tcp_mux(
             origin_agent_name: route_line.destination_agent_name.clone(),
             capabilities: route_line.capabilities.clone(),
             services: route_line.services.clone(),
-            path: vec![RouteHop {
-                agent_id: identity.id.clone(),
-                agent_name: identity.name.clone(),
-            }],
+            path: prepend_route_path(identity, &route_line.path),
         });
     }
     if route_announcements.is_empty() {
@@ -198,10 +208,7 @@ pub async fn send_route_snapshot_ws_mux(
             origin_agent_name: route_line.destination_agent_name.clone(),
             capabilities: route_line.capabilities.clone(),
             services: route_line.services.clone(),
-            path: vec![RouteHop {
-                agent_id: identity.id.clone(),
-                agent_name: identity.name.clone(),
-            }],
+            path: prepend_route_path(identity, &route_line.path),
         });
     }
     if route_announcements.is_empty() {
@@ -245,6 +252,42 @@ async fn allocate_tcp_relay_stream_id(allocator: &Arc<Mutex<u32>>) -> u32 {
     current
 }
 
+fn prepend_route_path(identity: &AgentIdentity, path: &[RouteHop]) -> Vec<RouteHop> {
+    let mut announced_path = Vec::with_capacity(path.len() + 1);
+    announced_path.push(RouteHop {
+        agent_id: identity.id.clone(),
+        agent_name: identity.name.clone(),
+    });
+    announced_path.extend(path.iter().cloned());
+    announced_path
+}
+
+fn validate_route_announcement(
+    local_agent_id: &str,
+    source_peer_id: &str,
+    announcement: &RouteAnnouncement,
+) -> Result<(), &'static str> {
+    let Some(next_hop) = announcement.direct_next_hop() else {
+        return Err("missing_next_hop");
+    };
+    if next_hop.agent_id != source_peer_id {
+        return Err("source_peer_mismatch");
+    }
+    if announcement.origin_agent_id == local_agent_id {
+        return Err("origin_is_local");
+    }
+    if announcement.contains_agent(local_agent_id) {
+        return Err("path_contains_local_agent");
+    }
+    if announcement.has_loop() {
+        return Err("path_loop_detected");
+    }
+    if !announcement.ends_at_origin() {
+        return Err("path_does_not_end_at_origin");
+    }
+    Ok(())
+}
+
 async fn allocate_ws_relay_stream_id(allocator: &Arc<Mutex<u32>>) -> u32 {
     let mut guard = allocator.lock().await;
     let current = *guard;
@@ -284,6 +327,89 @@ async fn bridge_tcp_stream_frames(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prepend_route_path, validate_route_announcement};
+    use crate::{
+        agent::identity::AgentIdentity,
+        app::config::AgentIdentityConfig,
+        protocol::route::{RouteAnnouncement, RouteHop},
+    };
+
+    #[test]
+    fn validate_route_announcement_rejects_local_loop() {
+        let announcement = RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec![],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "local-agent".into(),
+                    agent_name: "local-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            validate_route_announcement("local-agent", "peer-b", &announcement),
+            Err("path_contains_local_agent")
+        );
+    }
+
+    #[test]
+    fn validate_route_announcement_rejects_source_peer_mismatch() {
+        let announcement = RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec![],
+            services: vec!["task".into()],
+            path: vec![RouteHop {
+                agent_id: "peer-b".into(),
+                agent_name: "peer-b-name".into(),
+            }],
+        };
+
+        assert_eq!(
+            validate_route_announcement("local-agent", "peer-c", &announcement),
+            Err("source_peer_mismatch")
+        );
+    }
+
+    #[test]
+    fn prepend_route_path_keeps_known_multi_hop_path() {
+        let identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("relay-a".into()),
+            key: None,
+        });
+        let path = prepend_route_path(
+            &identity,
+            &[
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+            ],
+        );
+
+        assert_eq!(path.first().unwrap().agent_id, identity.id);
+        assert_eq!(path[1].agent_id, "peer-b");
+        assert_eq!(path[2].agent_id, "peer-c");
+    }
 }
 
 async fn bridge_ws_stream_frames(
@@ -327,19 +453,13 @@ pub async fn handle_tcp_relay_stream_open(
         .clone()
         .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
 
-    let next_hop = {
-        peer_map
-            .lock()
-            .await
-            .get(&destination_agent_id)
-            .cloned()
-    }
-    .ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            format!("no next hop available for stream destination {destination_agent_id}"),
-        )
-    })?;
+    let next_hop =
+        { peer_map.lock().await.get(&destination_agent_id).cloned() }.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no next hop available for stream destination {destination_agent_id}"),
+            )
+        })?;
 
     let target_stream_id = allocate_tcp_relay_stream_id(&allocator).await;
     upsert_relay_link(
@@ -452,19 +572,13 @@ pub async fn handle_ws_relay_stream_open(
         .clone()
         .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
 
-    let next_hop = {
-        peer_map
-            .lock()
-            .await
-            .get(&destination_agent_id)
-            .cloned()
-    }
-    .ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            format!("no next hop available for stream destination {destination_agent_id}"),
-        )
-    })?;
+    let next_hop =
+        { peer_map.lock().await.get(&destination_agent_id).cloned() }.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no next hop available for stream destination {destination_agent_id}"),
+            )
+        })?;
 
     let target_stream_id = allocate_ws_relay_stream_id(&allocator).await;
     upsert_relay_link(

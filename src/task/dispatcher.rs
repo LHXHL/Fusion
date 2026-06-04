@@ -21,11 +21,15 @@ pub async fn dispatch(request: &TaskRequestMessage) -> TaskResultMessage {
 }
 
 async fn dispatch_inner(request: &TaskRequestMessage) -> Result<TaskResultMessage, Error> {
-    let registry = CapabilityRegistry::default_for_platform(std::env::consts::OS, std::env::consts::ARCH);
+    let registry =
+        CapabilityRegistry::default_for_platform(std::env::consts::OS, std::env::consts::ARCH);
     if !registry.supports_task_action(&request.action) {
         return Err(Error::new(
             ErrorKind::Unsupported,
-            format!("task action {:?} is not enabled on this agent", request.action),
+            format!(
+                "task action {:?} is not enabled on this agent",
+                request.action
+            ),
         ));
     }
 

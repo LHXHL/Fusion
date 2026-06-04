@@ -202,7 +202,14 @@ pub async fn accept_mux_peer_on(
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(
+        reader,
+        shared_key.clone(),
+        routing.clone(),
+        open_tx,
+        control_tx,
+    )
+    .await;
 
     Ok(MuxTcpPeer {
         session,
@@ -264,7 +271,14 @@ pub async fn connect_mux_peer(
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(
+        reader,
+        shared_key.clone(),
+        routing.clone(),
+        open_tx,
+        control_tx,
+    )
+    .await;
 
     Ok(MuxTcpPeer {
         session,
