@@ -18,18 +18,33 @@ use tokio::{
 use crate::{
     agent::{
         identity::AgentIdentity,
-        registry::{AgentRegistry, RegisteredPeer, RegisteredRoute, RegisteredStream},
-        state::AgentRuntimeState,
+        registry::AgentRegistry,
     },
-    app::config::{AppConfig, ControlCommandConfig, StatusScope, TaskRequestConfig, TunnelEndpoint},
+    app::{
+        config::{AppConfig, TaskRequestConfig, TunnelEndpoint},
+        runtime_mode::{
+            collect_remote_port_forward_services, decide_inbound_runtime_mode,
+            decide_outbound_runtime_mode, InboundRuntimeMode, OutboundRuntimeMode,
+        },
+        runtime_relay::{
+            broadcast_control_frame_tcp, broadcast_control_frame_ws,
+            handle_registry_control_message, handle_tcp_relay_stream_open,
+            handle_ws_relay_stream_open, send_direct_announce_tcp_mux,
+            send_direct_announce_ws_mux, send_route_snapshot_tcp_mux,
+            send_route_snapshot_ws_mux, ROUTE_TTL_SECS,
+        },
+        runtime_status::{
+            print_control_snapshot, print_status_snapshot, spawn_status_snapshot_task, RelayLinkMap,
+        },
+        runtime_task::maybe_store_task_artifact,
+    },
     protocol::{
         codec::encode_frame,
         frame::{Frame, MessageType},
         message::{
-            AgentAnnounceMessage, HelloMessage, Message, StreamCloseMessage, StreamDataMessage,
+            HelloMessage, Message, StreamCloseMessage, StreamDataMessage,
             TaskRequestMessage,
         },
-        route::{RouteAnnouncement, RouteHop, RouteUpdateMessage},
     },
     serve::{
         portfwd::{proxy_connection as proxy_port_forward_connection, PortForwardService},
@@ -42,7 +57,6 @@ use crate::{
     },
     session::{
         hub::SessionHub,
-        peer::PeerSession,
         reconnect::ReconnectState,
         router::{decide_frame_route, RouteDecision},
         stream::StreamIdAllocator,
@@ -50,7 +64,7 @@ use crate::{
     task::dispatcher,
     tunnel::{
         dialer::{classify_endpoint, DialTarget},
-        listener::{bind_endpoint, ListenerTransport},
+        listener::bind_endpoint,
         tcp, tcp_mux, ws, ws_mux,
     },
 };
@@ -59,50 +73,7 @@ type TcpTaskPeerMap = Arc<Mutex<HashMap<String, tcp_mux::MuxTcpPeer>>>;
 type WsTaskPeerMap = Arc<Mutex<HashMap<String, ws_mux::MuxWsPeer>>>;
 type TcpRelayStreamAllocator = Arc<Mutex<u32>>;
 type WsRelayStreamAllocator = Arc<Mutex<u32>>;
-type RelayLinkMap = Arc<Mutex<HashMap<String, RelayStreamLink>>>;
 
-const ROUTE_TTL_SECS: u64 = 300;
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct RuntimeStatusSnapshot {
-    generated_at_unix: i64,
-    lines: Vec<String>,
-    peer_count: usize,
-    route_count: usize,
-    stream_count: usize,
-    sessions: Vec<PeerSession>,
-    peers: Vec<RegisteredPeer>,
-    routes: Vec<RegisteredRoute>,
-    streams: Vec<RegisteredStream>,
-    local_services: Vec<String>,
-    relay_links: Vec<RelayStreamLink>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct RelayStreamLink {
-    transport: String,
-    source_peer_agent_id: String,
-    source_stream_id: u32,
-    next_hop_agent_id: String,
-    relay_stream_id: u32,
-    destination_agent_id: String,
-    opened_at_unix: i64,
-}
-
-impl RelayStreamLink {
-    fn summary_line(&self) -> String {
-        format!(
-            "relay.link transport={} src_peer={} src_stream={} next_hop={} relay_stream={} dst={} opened_at={}",
-            self.transport,
-            self.source_peer_agent_id,
-            self.source_stream_id,
-            self.next_hop_agent_id,
-            self.relay_stream_id,
-            self.destination_agent_id,
-            self.opened_at_unix
-        )
-    }
-}
 
 pub async fn run(config: AppConfig) -> Result<(), Error> {
     if let Some(status) = &config.status_command {
@@ -217,13 +188,8 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         .iter()
         .find(|svc| matches!(svc.kind, ServiceKind::RemoteRaw(_) | ServiceKind::RemotePortForward(_)))
         .cloned();
-    let remote_port_forward_services: Vec<PortForwardService> = remote_services
-        .iter()
-        .filter_map(|svc| match &svc.kind {
-            ServiceKind::RemotePortForward(service) => Some(service.clone()),
-            _ => None,
-        })
-        .collect();
+    let remote_port_forward_services: Vec<PortForwardService> =
+        collect_remote_port_forward_services(&remote_services);
 
     for service in &remote_port_forward_services {
         let listener = service.bind_listener().await?;
@@ -254,8 +220,12 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                 continue;
             }
         };
-        match bound.transport {
-            ListenerTransport::Tcp if inbound_raw_service.is_some() && local_services.is_empty() => {
+        match decide_inbound_runtime_mode(
+            bound.transport,
+            inbound_raw_service.is_some(),
+            !local_services.is_empty(),
+        ) {
+            InboundRuntimeMode::RawTcp => {
                 let listener_identity = identity.clone();
                 let hub = hub.clone();
                 let registry = registry.clone();
@@ -276,7 +246,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                     }
                 }));
             }
-            ListenerTransport::Tcp => {
+            InboundRuntimeMode::TaskTcp => {
                 let listener_identity = identity.clone();
                 let hub = hub.clone();
                 let registry = registry.clone();
@@ -303,7 +273,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                     }
                 }));
             }
-            ListenerTransport::Ws if inbound_raw_service.is_some() && local_services.is_empty() => {
+            InboundRuntimeMode::RawWs => {
                 let listener_identity = identity.clone();
                 let hub = hub.clone();
                 let registry = registry.clone();
@@ -314,6 +284,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                     if let Err(err) = run_inbound_raw_ws_once(
                         listener_identity,
                         bound.listener,
+                        bound.ws_tls_acceptor,
                         raw_service,
                         hub,
                         registry,
@@ -324,7 +295,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                     }
                 }));
             }
-            ListenerTransport::Ws => {
+            InboundRuntimeMode::TaskWs => {
                 let listener_identity = identity.clone();
                 let hub = hub.clone();
                 let registry = registry.clone();
@@ -338,6 +309,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                     if let Err(err) = run_inbound_task_server_ws(
                         listener_identity,
                         bound.listener,
+                        bound.ws_tls_acceptor,
                         listener_services,
                         hub,
                         registry,
@@ -375,22 +347,24 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         tasks.push(tokio::spawn(async move {
             let mut state = ReconnectState::new(&retry);
             loop {
-                let result = if let Some(task_request) = task_request.clone() {
-                    run_outbound_task_once(
+                let result = match decide_outbound_runtime_mode(
+                    &connect_endpoint,
+                    task_request.as_ref(),
+                    local_socks.is_some(),
+                    remote_egress.is_some(),
+                    has_listener,
+                ) {
+                    OutboundRuntimeMode::Task => run_outbound_task_once(
                         connect_identity.clone(),
                         &connect_endpoint,
-                        task_request,
+                        task_request.clone().unwrap(),
                         data_dir.clone(),
                         exposed_service_labels.clone(),
                         hub.clone(),
                         registry.clone(),
                     )
-                    .await
-                } else if connect_endpoint.url.scheme == "tcp"
-                    && local_socks.is_some()
-                    && remote_egress.is_some()
-                {
-                    run_outbound_socks5_once(
+                    .await,
+                    OutboundRuntimeMode::Socks5Tcp => run_outbound_socks5_once(
                         connect_identity.clone(),
                         &connect_endpoint,
                         local_socks.clone().unwrap(),
@@ -399,12 +373,8 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                         hub.clone(),
                         registry.clone(),
                     )
-                    .await
-                } else if matches!(connect_endpoint.url.scheme.as_str(), "ws" | "wss")
-                    && local_socks.is_some()
-                    && remote_egress.is_some()
-                {
-                    run_outbound_socks5_ws_once(
+                    .await,
+                    OutboundRuntimeMode::Socks5Ws => run_outbound_socks5_ws_once(
                         connect_identity.clone(),
                         &connect_endpoint,
                         local_socks.clone().unwrap(),
@@ -413,9 +383,8 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                         hub.clone(),
                         registry.clone(),
                     )
-                    .await
-                } else if connect_endpoint.url.scheme == "tcp" && has_listener {
-                    run_outbound_relay_peer_tcp(
+                    .await,
+                    OutboundRuntimeMode::RelayTcp => run_outbound_relay_peer_tcp(
                         connect_identity.clone(),
                         &connect_endpoint,
                         exposed_service_labels.clone(),
@@ -425,11 +394,8 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                         tcp_relay_stream_allocator.clone(),
                         relay_links.clone(),
                     )
-                    .await
-                } else if matches!(connect_endpoint.url.scheme.as_str(), "ws" | "wss")
-                    && has_listener
-                {
-                    run_outbound_relay_peer_ws(
+                    .await,
+                    OutboundRuntimeMode::RelayWs => run_outbound_relay_peer_ws(
                         connect_identity.clone(),
                         &connect_endpoint,
                         exposed_service_labels.clone(),
@@ -439,15 +405,14 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
                         ws_relay_stream_allocator.clone(),
                         relay_links.clone(),
                     )
-                    .await
-                } else {
-                    run_outbound_once(
+                    .await,
+                    OutboundRuntimeMode::Direct => run_outbound_once(
                         connect_identity.clone(),
                         &connect_endpoint,
                         hub.clone(),
                         registry.clone(),
                     )
-                    .await
+                    .await,
                 };
                 match result {
                     Ok(()) => break,
@@ -506,1027 +471,6 @@ async fn run_remote_port_forward_listener(
             }
         });
     }
-}
-
-fn runtime_status_snapshot_path(data_dir: &PathBuf) -> PathBuf {
-    data_dir.join("runtime-status.json")
-}
-
-fn relay_link_key(transport: &str, source_peer_agent_id: &str, source_stream_id: u32) -> String {
-    format!("{transport}:{source_peer_agent_id}:{source_stream_id}")
-}
-
-async fn upsert_relay_link(
-    relay_links: &RelayLinkMap,
-    transport: &str,
-    source_peer_agent_id: String,
-    source_stream_id: u32,
-    next_hop_agent_id: String,
-    relay_stream_id: u32,
-    destination_agent_id: String,
-) {
-    relay_links.lock().await.insert(
-        relay_link_key(transport, &source_peer_agent_id, source_stream_id),
-        RelayStreamLink {
-            transport: transport.to_string(),
-            source_peer_agent_id,
-            source_stream_id,
-            next_hop_agent_id,
-            relay_stream_id,
-            destination_agent_id,
-            opened_at_unix: Utc::now().timestamp(),
-        },
-    );
-}
-
-async fn remove_relay_link(
-    relay_links: &RelayLinkMap,
-    transport: &str,
-    source_peer_agent_id: &str,
-    source_stream_id: u32,
-) {
-    relay_links
-        .lock()
-        .await
-        .remove(&relay_link_key(transport, source_peer_agent_id, source_stream_id));
-}
-
-async fn write_status_snapshot(
-    data_dir: &PathBuf,
-    hub: &Arc<Mutex<SessionHub>>,
-    registry: &Arc<Mutex<AgentRegistry>>,
-    relay_links: &RelayLinkMap,
-) -> Result<(), Error> {
-    tokio::fs::create_dir_all(data_dir).await?;
-    let hub_guard = hub.lock().await;
-    let sessions = hub_guard.sessions_snapshot();
-    let mut lines = hub_guard.summary_lines();
-    drop(hub_guard);
-
-    let registry_guard = registry.lock().await;
-    let local_services = registry_guard.local_services_snapshot();
-    let peers = registry_guard.peers_snapshot();
-    let routes = registry_guard.routes_snapshot();
-    let streams = registry_guard.streams_snapshot();
-    let registry_summary = registry_guard.summary_lines();
-    drop(registry_guard);
-
-    lines.extend(registry_summary.clone());
-    let relay_links = {
-        let guard = relay_links.lock().await;
-        let mut links: Vec<_> = guard.values().cloned().collect();
-        links.sort_by(|a, b| {
-            a.transport
-                .cmp(&b.transport)
-                .then(a.source_peer_agent_id.cmp(&b.source_peer_agent_id))
-                .then(a.source_stream_id.cmp(&b.source_stream_id))
-        });
-        links
-    };
-    lines.push(format!("relay.link_count={}", relay_links.len()));
-    for link in &relay_links {
-        lines.push(link.summary_line());
-    }
-    let state = AgentRuntimeState {
-        sessions: sessions.clone(),
-        peers: peers.clone(),
-        routes: routes.clone(),
-        streams: streams.clone(),
-        exposed_services: local_services.clone(),
-    };
-    lines.extend(state.summary_lines());
-    let snapshot = RuntimeStatusSnapshot {
-        generated_at_unix: Utc::now().timestamp(),
-        lines,
-        peer_count: state.peers.len(),
-        route_count: state.routes.len(),
-        stream_count: state.streams.len(),
-        sessions,
-        peers,
-        routes,
-        streams,
-        local_services,
-        relay_links,
-    };
-    let path = runtime_status_snapshot_path(data_dir);
-    let payload = serde_json::to_vec_pretty(&snapshot)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    tokio::fs::write(path, payload).await
-}
-
-fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope) -> Vec<String> {
-    let mut lines = vec![format!("status.generated_at={}", snapshot.generated_at_unix)];
-    match scope {
-        StatusScope::All => {
-            lines.push(format!("session.count={}", snapshot.sessions.len()));
-            for session in &snapshot.sessions {
-                lines.push(format!(
-                    "session.peer={} name={} state={:?}",
-                    session.remote.agent_id, session.remote.agent_name, session.state
-                ));
-            }
-            lines.push(format!("registry.peer_count={}", snapshot.peers.len()));
-            for peer in &snapshot.peers {
-                lines.push(format!(
-                    "registry.peer={} name={} state={:?} last_seen={}",
-                    peer.session.remote.agent_id,
-                    peer.session.remote.agent_name,
-                    peer.session.state,
-                    peer.last_seen_unix
-                ));
-            }
-            lines.push(format!("registry.route_count={}", snapshot.routes.len()));
-            for route in &snapshot.routes {
-                lines.push(format!(
-                    "registry.route={} next_hop={} hops={} services={} capabilities={} learned_at={}",
-                    route.destination_agent_id,
-                    route.next_hop_agent_id,
-                    route.hop_count,
-                    route.services.join(","),
-                    route.capabilities.join(","),
-                    route.learned_at_unix
-                ));
-            }
-            lines.push(format!("registry.stream_count={}", snapshot.streams.len()));
-            for stream in &snapshot.streams {
-                lines.push(format!(
-                    "registry.stream={} peer={} service={} target={} state={:?} opened_at={} closed_at={} last_error={}",
-                    stream.stream_id,
-                    stream.peer_agent_id,
-                    stream.service,
-                    stream.target,
-                    stream.state,
-                    stream.opened_at_unix,
-                    stream
-                        .closed_at_unix
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    stream
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string())
-                ));
-            }
-            lines.push(format!("relay.link_count={}", snapshot.relay_links.len()));
-            for link in &snapshot.relay_links {
-                lines.push(link.summary_line());
-            }
-        }
-        StatusScope::Peers => {
-            lines.push(format!("session.count={}", snapshot.sessions.len()));
-            for session in &snapshot.sessions {
-                lines.push(format!(
-                    "session.peer={} name={} state={:?}",
-                    session.remote.agent_id, session.remote.agent_name, session.state
-                ));
-            }
-            lines.push(format!("registry.peer_count={}", snapshot.peers.len()));
-            for peer in &snapshot.peers {
-                lines.push(format!(
-                    "registry.peer={} name={} state={:?} last_seen={}",
-                    peer.session.remote.agent_id,
-                    peer.session.remote.agent_name,
-                    peer.session.state,
-                    peer.last_seen_unix
-                ));
-            }
-        }
-        StatusScope::Routes => {
-            lines.push(format!("registry.route_count={}", snapshot.routes.len()));
-            for route in &snapshot.routes {
-                lines.push(format!(
-                    "registry.route={} next_hop={} hops={} services={} capabilities={} learned_at={}",
-                    route.destination_agent_id,
-                    route.next_hop_agent_id,
-                    route.hop_count,
-                    route.services.join(","),
-                    route.capabilities.join(","),
-                    route.learned_at_unix
-                ));
-            }
-        }
-        StatusScope::Streams => {
-            lines.push(format!("registry.stream_count={}", snapshot.streams.len()));
-            for stream in &snapshot.streams {
-                lines.push(format!(
-                    "registry.stream={} peer={} service={} target={} state={:?} opened_at={} closed_at={} last_error={}",
-                    stream.stream_id,
-                    stream.peer_agent_id,
-                    stream.service,
-                    stream.target,
-                    stream.state,
-                    stream.opened_at_unix,
-                    stream
-                        .closed_at_unix
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    stream
-                        .last_error
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string())
-                ));
-            }
-            lines.push(format!("relay.link_count={}", snapshot.relay_links.len()));
-            for link in &snapshot.relay_links {
-                lines.push(link.summary_line());
-            }
-        }
-    }
-    lines
-}
-
-fn spawn_status_snapshot_task(
-    data_dir: PathBuf,
-    hub: Arc<Mutex<SessionHub>>,
-    registry: Arc<Mutex<AgentRegistry>>,
-    relay_links: RelayLinkMap,
-) {
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = write_status_snapshot(&data_dir, &hub, &registry, &relay_links).await
-            {
-                eprintln!("status.snapshot.error={}", err);
-            }
-            sleep(std::time::Duration::from_secs(1)).await;
-        }
-    });
-}
-
-async fn print_status_snapshot(
-    data_dir: &PathBuf,
-    scope: StatusScope,
-    json: bool,
-) -> Result<(), Error> {
-    let path = runtime_status_snapshot_path(data_dir);
-    let payload = tokio::fs::read(&path).await.map_err(|err| {
-        Error::new(
-            err.kind(),
-            format!("failed to read runtime status snapshot {}: {}", path.display(), err),
-        )
-    })?;
-    let snapshot: RuntimeStatusSnapshot = serde_json::from_slice(&payload)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    if json {
-        let filtered = match scope {
-            StatusScope::All => serde_json::json!({
-                "generated_at_unix": snapshot.generated_at_unix,
-                "session_count": snapshot.sessions.len(),
-                "peer_count": snapshot.peer_count,
-                "route_count": snapshot.route_count,
-                "stream_count": snapshot.stream_count,
-                "sessions": snapshot.sessions,
-                "peers": snapshot.peers,
-                "routes": snapshot.routes,
-                "streams": snapshot.streams,
-                "relay_links": snapshot.relay_links,
-            }),
-            StatusScope::Peers => serde_json::json!({
-                "generated_at_unix": snapshot.generated_at_unix,
-                "sessions": snapshot.sessions,
-                "peers": snapshot.peers,
-            }),
-            StatusScope::Routes => serde_json::json!({
-                "generated_at_unix": snapshot.generated_at_unix,
-                "routes": snapshot.routes,
-            }),
-            StatusScope::Streams => serde_json::json!({
-                "generated_at_unix": snapshot.generated_at_unix,
-                "streams": snapshot.streams,
-                "relay_links": snapshot.relay_links,
-            }),
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&filtered)
-                .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-        );
-        return Ok(());
-    }
-    for line in render_status_lines(&snapshot, scope) {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn render_services_lines(snapshot: &RuntimeStatusSnapshot) -> Vec<String> {
-    let mut lines = vec![format!("status.generated_at={}", snapshot.generated_at_unix)];
-    lines.push(format!(
-        "service.exposed_count={}",
-        snapshot.local_services.len()
-    ));
-    for service in &snapshot.local_services {
-        lines.push(service.clone());
-    }
-
-    let remote_count: usize = snapshot.routes.iter().map(|route| route.services.len()).sum();
-    lines.push(format!("service.remote_count={remote_count}"));
-    for route in &snapshot.routes {
-        for service in &route.services {
-            lines.push(format!(
-                "service.remote={} owner={} next_hop={} hops={}",
-                service, route.destination_agent_id, route.next_hop_agent_id, route.hop_count
-            ));
-        }
-    }
-    lines
-}
-
-async fn print_control_snapshot(
-    data_dir: &PathBuf,
-    command: &ControlCommandConfig,
-) -> Result<(), Error> {
-    let path = runtime_status_snapshot_path(data_dir);
-    let payload = tokio::fs::read(&path).await.map_err(|err| {
-        Error::new(
-            err.kind(),
-            format!("failed to read runtime status snapshot {}: {}", path.display(), err),
-        )
-    })?;
-    let snapshot: RuntimeStatusSnapshot = serde_json::from_slice(&payload)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-
-    match command {
-        ControlCommandConfig::PeersList { json } => {
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "generated_at_unix": snapshot.generated_at_unix,
-                        "sessions": snapshot.sessions,
-                        "peers": snapshot.peers,
-                    }))
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-                );
-            } else {
-                for line in render_status_lines(&snapshot, StatusScope::Peers) {
-                    println!("{line}");
-                }
-            }
-        }
-        ControlCommandConfig::PeersInfo { peer_id, json } => {
-            let session = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.remote.agent_id == *peer_id)
-                .cloned();
-            let peer = snapshot
-                .peers
-                .iter()
-                .find(|peer| peer.session.remote.agent_id == *peer_id)
-                .cloned();
-            let routes: Vec<_> = snapshot
-                .routes
-                .iter()
-                .filter(|route| {
-                    route.destination_agent_id == *peer_id || route.next_hop_agent_id == *peer_id
-                })
-                .cloned()
-                .collect();
-            let streams: Vec<_> = snapshot
-                .streams
-                .iter()
-                .filter(|stream| stream.peer_agent_id == *peer_id)
-                .cloned()
-                .collect();
-            let relay_links: Vec<_> = snapshot
-                .relay_links
-                .iter()
-                .filter(|link| {
-                    link.source_peer_agent_id == *peer_id
-                        || link.next_hop_agent_id == *peer_id
-                        || link.destination_agent_id == *peer_id
-                })
-                .cloned()
-                .collect();
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "generated_at_unix": snapshot.generated_at_unix,
-                        "peer_id": peer_id,
-                        "session": session,
-                        "peer": peer,
-                        "routes": routes,
-                        "streams": streams,
-                        "relay_links": relay_links,
-                    }))
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-                );
-            } else {
-                println!("status.generated_at={}", snapshot.generated_at_unix);
-                println!("peer.id={peer_id}");
-                if let Some(session) = session {
-                    println!(
-                        "peer.session.remote_name={} state={:?}",
-                        session.remote.agent_name, session.state
-                    );
-                }
-                if let Some(peer) = peer {
-                    println!("peer.last_seen={}", peer.last_seen_unix);
-                    println!(
-                        "peer.capabilities={}",
-                        peer.session.remote.capabilities.join(",")
-                    );
-                }
-                println!("peer.route_count={}", routes.len());
-                for route in routes {
-                    println!(
-                        "peer.route={} next_hop={} hops={} services={}",
-                        route.destination_agent_id,
-                        route.next_hop_agent_id,
-                        route.hop_count,
-                        route.services.join(",")
-                    );
-                }
-                println!("peer.stream_count={}", streams.len());
-                for stream in streams {
-                    println!(
-                        "peer.stream={} service={} target={} state={:?}",
-                        stream.stream_id, stream.service, stream.target, stream.state
-                    );
-                }
-                println!("peer.relay_link_count={}", relay_links.len());
-                for link in relay_links {
-                    println!("{}", link.summary_line());
-                }
-            }
-        }
-        ControlCommandConfig::RoutesList { json } => {
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "generated_at_unix": snapshot.generated_at_unix,
-                        "routes": snapshot.routes,
-                    }))
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-                );
-            } else {
-                for line in render_status_lines(&snapshot, StatusScope::Routes) {
-                    println!("{line}");
-                }
-            }
-        }
-        ControlCommandConfig::ServicesList { json } => {
-            if *json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "generated_at_unix": snapshot.generated_at_unix,
-                        "local_services": snapshot.local_services,
-                        "remote_services": snapshot.routes.iter().map(|route| serde_json::json!({
-                            "owner_agent_id": route.destination_agent_id,
-                            "owner_agent_name": route.destination_agent_name,
-                            "next_hop_agent_id": route.next_hop_agent_id,
-                            "hop_count": route.hop_count,
-                            "services": route.services,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
-                );
-            } else {
-                for line in render_services_lines(&snapshot) {
-                    println!("{line}");
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn build_local_announce(identity: &AgentIdentity, services: &[String]) -> AgentAnnounceMessage {
-    AgentAnnounceMessage {
-        agent_id: identity.id.clone(),
-        agent_name: identity.name.clone(),
-        capabilities: identity.capability_labels(),
-        services: services.to_vec(),
-    }
-}
-
-fn build_direct_route_update(identity: &AgentIdentity, services: &[String]) -> RouteUpdateMessage {
-    RouteUpdateMessage {
-        announcements: vec![RouteAnnouncement {
-            origin_agent_id: identity.id.clone(),
-            origin_agent_name: identity.name.clone(),
-            capabilities: identity.capability_labels(),
-            services: services.to_vec(),
-            path: vec![RouteHop {
-                agent_id: identity.id.clone(),
-                agent_name: identity.name.clone(),
-            }],
-        }],
-    }
-}
-
-async fn send_direct_announce_ws_mux(
-    peer: &ws_mux::MuxWsPeer,
-    identity: &AgentIdentity,
-    services: &[String],
-) -> Result<(), Error> {
-    let announce = Frame::new(
-        MessageType::AgentAnnounce,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::AgentAnnounce(build_local_announce(identity, services)),
-    );
-    peer.send_frame(&announce).await?;
-    let route = Frame::new(
-        MessageType::RouteUpdate,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::RouteUpdate(build_direct_route_update(identity, services)),
-    );
-    peer.send_frame(&route).await
-}
-
-fn handle_registry_control_message(
-    registry: &mut AgentRegistry,
-    peer_agent_id: &str,
-    message: &Message,
-) -> bool {
-    let pruned = registry.prune_stale_routes(ROUTE_TTL_SECS);
-    if pruned > 0 {
-        eprintln!("registry.route_pruned={}", pruned);
-    }
-    match message {
-        Message::AgentAnnounce(announce) => {
-            registry.upsert_announce(announce, peer_agent_id);
-            true
-        }
-        Message::RouteUpdate(update) => {
-            for announcement in &update.announcements {
-                registry.upsert_route_announcement(announcement);
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
-async fn send_direct_announce_tcp_mux(
-    peer: &tcp_mux::MuxTcpPeer,
-    identity: &AgentIdentity,
-    services: &[String],
-) -> Result<(), Error> {
-    let announce = Frame::new(
-        MessageType::AgentAnnounce,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::AgentAnnounce(build_local_announce(identity, services)),
-    );
-    peer.send_frame(&announce).await?;
-    let route = Frame::new(
-        MessageType::RouteUpdate,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::RouteUpdate(build_direct_route_update(identity, services)),
-    );
-    peer.send_frame(&route).await
-}
-
-async fn send_route_snapshot_tcp_mux(
-    peer: &tcp_mux::MuxTcpPeer,
-    identity: &AgentIdentity,
-    routes: &[RegisteredRoute],
-    exclude_destination: Option<String>,
-) -> Result<(), Error> {
-    let mut route_announcements = Vec::new();
-    for route_line in routes {
-        if exclude_destination.as_deref() == Some(route_line.destination_agent_id.as_str()) {
-            continue;
-        }
-        route_announcements.push(RouteAnnouncement {
-            origin_agent_id: route_line.destination_agent_id.clone(),
-            origin_agent_name: route_line.destination_agent_name.clone(),
-            capabilities: route_line.capabilities.clone(),
-            services: route_line.services.clone(),
-            path: vec![RouteHop {
-                agent_id: identity.id.clone(),
-                agent_name: identity.name.clone(),
-            }],
-        });
-    }
-    if route_announcements.is_empty() {
-        return Ok(());
-    }
-    let frame = Frame::new(
-        MessageType::RouteUpdate,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::RouteUpdate(RouteUpdateMessage {
-            announcements: route_announcements,
-        }),
-    );
-    peer.send_frame(&frame).await
-}
-
-fn prepare_forward_frame_for_broadcast(identity: &AgentIdentity, frame: &Frame) -> Frame {
-    let mut forwarded = frame.clone();
-    forwarded.header.src_agent = Some(identity.id.clone());
-    if let Message::RouteUpdate(update) = &mut forwarded.message {
-        for announcement in &mut update.announcements {
-            announcement.path.insert(
-                0,
-                RouteHop {
-                    agent_id: identity.id.clone(),
-                    agent_name: identity.name.clone(),
-                },
-            );
-        }
-    }
-    forwarded
-}
-
-async fn broadcast_control_frame_tcp(
-    peer_map: &TcpTaskPeerMap,
-    identity: &AgentIdentity,
-    source_peer_id: &str,
-    frame: &Frame,
-) -> Result<(), Error> {
-    let forwarded = prepare_forward_frame_for_broadcast(identity, frame);
-    let peers: Vec<_> = peer_map
-        .lock()
-        .await
-        .iter()
-        .filter(|(peer_id, _)| peer_id.as_str() != source_peer_id)
-        .map(|(_, peer)| peer.clone())
-        .collect();
-    for peer in peers {
-        peer.send_frame(&forwarded).await?;
-    }
-    Ok(())
-}
-
-async fn send_route_snapshot_ws_mux(
-    peer: &ws_mux::MuxWsPeer,
-    identity: &AgentIdentity,
-    routes: &[RegisteredRoute],
-    exclude_destination: Option<String>,
-) -> Result<(), Error> {
-    let mut route_announcements = Vec::new();
-    for route_line in routes {
-        if exclude_destination.as_deref() == Some(route_line.destination_agent_id.as_str()) {
-            continue;
-        }
-        route_announcements.push(RouteAnnouncement {
-            origin_agent_id: route_line.destination_agent_id.clone(),
-            origin_agent_name: route_line.destination_agent_name.clone(),
-            capabilities: route_line.capabilities.clone(),
-            services: route_line.services.clone(),
-            path: vec![RouteHop {
-                agent_id: identity.id.clone(),
-                agent_name: identity.name.clone(),
-            }],
-        });
-    }
-    if route_announcements.is_empty() {
-        return Ok(());
-    }
-    let frame = Frame::new(
-        MessageType::RouteUpdate,
-        Some(identity.id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::RouteUpdate(RouteUpdateMessage {
-            announcements: route_announcements,
-        }),
-    );
-    peer.send_frame(&frame).await
-}
-
-async fn broadcast_control_frame_ws(
-    peer_map: &WsTaskPeerMap,
-    identity: &AgentIdentity,
-    source_peer_id: &str,
-    frame: &Frame,
-) -> Result<(), Error> {
-    let forwarded = prepare_forward_frame_for_broadcast(identity, frame);
-    let peers: Vec<_> = peer_map
-        .lock()
-        .await
-        .iter()
-        .filter(|(peer_id, _)| peer_id.as_str() != source_peer_id)
-        .map(|(_, peer)| peer.clone())
-        .collect();
-    for peer in peers {
-        peer.send_frame(&forwarded).await?;
-    }
-    Ok(())
-}
-
-async fn allocate_tcp_relay_stream_id(allocator: &TcpRelayStreamAllocator) -> u32 {
-    let mut guard = allocator.lock().await;
-    let current = *guard;
-    *guard = guard.saturating_add(1);
-    current
-}
-
-async fn allocate_ws_relay_stream_id(allocator: &WsRelayStreamAllocator) -> u32 {
-    let mut guard = allocator.lock().await;
-    let current = *guard;
-    *guard = guard.saturating_add(1);
-    current
-}
-
-fn rewrite_stream_frame(
-    frame: &Frame,
-    stream_id: u32,
-    dst_agent: Option<String>,
-) -> Result<Frame, Error> {
-    if frame.header.stream_id.is_none() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "expected stream frame with stream_id",
-        ));
-    }
-    let mut forwarded = frame.clone();
-    forwarded.header.stream_id = Some(stream_id);
-    forwarded.header.dst_agent = dst_agent;
-    Ok(forwarded)
-}
-
-async fn bridge_tcp_stream_frames(
-    mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
-    to_peer: tcp_mux::MuxTcpPeer,
-    target_stream_id: u32,
-    target_dst_agent: Option<String>,
-) -> Result<(), Error> {
-    while let Some(frame) = from_rx.recv().await {
-        let forwarded = rewrite_stream_frame(&frame, target_stream_id, target_dst_agent.clone())?;
-        let should_close = matches!(forwarded.message, Message::StreamClose(_));
-        to_peer.send_frame(&forwarded).await?;
-        if should_close {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn bridge_ws_stream_frames(
-    mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
-    to_peer: ws_mux::MuxWsPeer,
-    target_stream_id: u32,
-    target_dst_agent: Option<String>,
-) -> Result<(), Error> {
-    while let Some(frame) = from_rx.recv().await {
-        let forwarded = rewrite_stream_frame(&frame, target_stream_id, target_dst_agent.clone())?;
-        let should_close = matches!(forwarded.message, Message::StreamClose(_));
-        to_peer.send_frame(&forwarded).await?;
-        if should_close {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn handle_tcp_relay_stream_open(
-    peer_map: TcpTaskPeerMap,
-    allocator: TcpRelayStreamAllocator,
-    relay_links: RelayLinkMap,
-    source_peer: tcp_mux::MuxTcpPeer,
-    open_frame: Frame,
-) -> Result<(), Error> {
-    let source_stream_id = open_frame.header.stream_id.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "missing stream_id on relay StreamOpen frame",
-        )
-    })?;
-    let destination_agent_id = open_frame
-        .header
-        .dst_agent
-        .clone()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing dst_agent on StreamOpen"))?;
-    let source_agent_id = open_frame
-        .header
-        .src_agent
-        .clone()
-        .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
-
-    let next_hop = {
-        peer_map
-            .lock()
-            .await
-            .get(&destination_agent_id)
-            .cloned()
-    }
-    .ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            format!("no next hop available for stream destination {destination_agent_id}"),
-        )
-    })?;
-
-    let target_stream_id = allocate_tcp_relay_stream_id(&allocator).await;
-    upsert_relay_link(
-        &relay_links,
-        "tcp",
-        source_peer.session.remote.agent_id.clone(),
-        source_stream_id,
-        next_hop.session.remote.agent_id.clone(),
-        target_stream_id,
-        destination_agent_id.clone(),
-    )
-    .await;
-    let downstream_rx = source_peer.open_stream_receiver(source_stream_id).await;
-    let upstream_rx = next_hop.open_stream_receiver(target_stream_id).await;
-    let forwarded_open = rewrite_stream_frame(
-        &open_frame,
-        target_stream_id,
-        Some(destination_agent_id.clone()),
-    )?;
-    next_hop.send_frame(&forwarded_open).await?;
-
-    let downstream_peer = source_peer.clone();
-    let upstream_peer = next_hop.clone();
-    let destination_agent_id_for_forward = destination_agent_id.clone();
-    let relay_links_for_forward = relay_links.clone();
-    let source_peer_id_for_forward = source_peer.session.remote.agent_id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = bridge_tcp_stream_frames(
-            downstream_rx,
-            upstream_peer.clone(),
-            target_stream_id,
-            Some(destination_agent_id_for_forward.clone()),
-        )
-        .await
-        {
-            eprintln!(
-                "stream.relay.forward.error={} src_peer={} stream_id={}",
-                err, downstream_peer.session.remote.agent_id, source_stream_id
-            );
-        }
-        remove_relay_link(
-            &relay_links_for_forward,
-            "tcp",
-            &source_peer_id_for_forward,
-            source_stream_id,
-        )
-        .await;
-    });
-
-    let downstream_peer = source_peer.clone();
-    let upstream_peer = next_hop.clone();
-    let source_agent_id_for_return = source_agent_id.clone();
-    let relay_links_for_return = relay_links.clone();
-    let source_peer_id_for_return = source_peer.session.remote.agent_id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = bridge_tcp_stream_frames(
-            upstream_rx,
-            downstream_peer.clone(),
-            source_stream_id,
-            Some(source_agent_id_for_return.clone()),
-        )
-        .await
-        {
-            eprintln!(
-                "stream.relay.return.error={} src_peer={} stream_id={}",
-                err, upstream_peer.session.remote.agent_id, target_stream_id
-            );
-        }
-        remove_relay_link(
-            &relay_links_for_return,
-            "tcp",
-            &source_peer_id_for_return,
-            source_stream_id,
-        )
-        .await;
-    });
-
-    eprintln!(
-        "stream.relay.open src_peer={} src_stream={} next_hop={} relay_stream={} dst={}",
-        source_peer.session.remote.agent_id,
-        source_stream_id,
-        next_hop.session.remote.agent_id,
-        target_stream_id,
-        destination_agent_id
-    );
-    Ok(())
-}
-
-async fn handle_ws_relay_stream_open(
-    peer_map: WsTaskPeerMap,
-    allocator: WsRelayStreamAllocator,
-    relay_links: RelayLinkMap,
-    source_peer: ws_mux::MuxWsPeer,
-    open_frame: Frame,
-) -> Result<(), Error> {
-    let source_stream_id = open_frame.header.stream_id.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            "missing stream_id on relay StreamOpen frame",
-        )
-    })?;
-    let destination_agent_id = open_frame
-        .header
-        .dst_agent
-        .clone()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing dst_agent on StreamOpen"))?;
-    let source_agent_id = open_frame
-        .header
-        .src_agent
-        .clone()
-        .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
-
-    let next_hop = {
-        peer_map
-            .lock()
-            .await
-            .get(&destination_agent_id)
-            .cloned()
-    }
-    .ok_or_else(|| {
-        Error::new(
-            ErrorKind::NotFound,
-            format!("no next hop available for stream destination {destination_agent_id}"),
-        )
-    })?;
-
-    let target_stream_id = allocate_ws_relay_stream_id(&allocator).await;
-    upsert_relay_link(
-        &relay_links,
-        "ws",
-        source_peer.session.remote.agent_id.clone(),
-        source_stream_id,
-        next_hop.session.remote.agent_id.clone(),
-        target_stream_id,
-        destination_agent_id.clone(),
-    )
-    .await;
-    let downstream_rx = source_peer.open_stream_receiver(source_stream_id).await;
-    let upstream_rx = next_hop.open_stream_receiver(target_stream_id).await;
-    let forwarded_open = rewrite_stream_frame(
-        &open_frame,
-        target_stream_id,
-        Some(destination_agent_id.clone()),
-    )?;
-    next_hop.send_frame(&forwarded_open).await?;
-
-    let downstream_peer = source_peer.clone();
-    let upstream_peer = next_hop.clone();
-    let destination_agent_id_for_forward = destination_agent_id.clone();
-    let relay_links_for_forward = relay_links.clone();
-    let source_peer_id_for_forward = source_peer.session.remote.agent_id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = bridge_ws_stream_frames(
-            downstream_rx,
-            upstream_peer.clone(),
-            target_stream_id,
-            Some(destination_agent_id_for_forward.clone()),
-        )
-        .await
-        {
-            eprintln!(
-                "stream.relay.forward.error={} src_peer={} stream_id={}",
-                err, downstream_peer.session.remote.agent_id, source_stream_id
-            );
-        }
-        remove_relay_link(
-            &relay_links_for_forward,
-            "ws",
-            &source_peer_id_for_forward,
-            source_stream_id,
-        )
-        .await;
-    });
-
-    let downstream_peer = source_peer.clone();
-    let upstream_peer = next_hop.clone();
-    let source_agent_id_for_return = source_agent_id.clone();
-    let relay_links_for_return = relay_links.clone();
-    let source_peer_id_for_return = source_peer.session.remote.agent_id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = bridge_ws_stream_frames(
-            upstream_rx,
-            downstream_peer.clone(),
-            source_stream_id,
-            Some(source_agent_id_for_return.clone()),
-        )
-        .await
-        {
-            eprintln!(
-                "stream.relay.return.error={} src_peer={} stream_id={}",
-                err, upstream_peer.session.remote.agent_id, target_stream_id
-            );
-        }
-        remove_relay_link(
-            &relay_links_for_return,
-            "ws",
-            &source_peer_id_for_return,
-            source_stream_id,
-        )
-        .await;
-    });
-
-    eprintln!(
-        "stream.relay.open src_peer={} src_stream={} next_hop={} relay_stream={} dst={}",
-        source_peer.session.remote.agent_id,
-        source_stream_id,
-        next_hop.session.remote.agent_id,
-        target_stream_id,
-        destination_agent_id
-    );
-    Ok(())
 }
 
 async fn run_inbound_task_server_tcp(
@@ -2196,6 +1140,7 @@ async fn run_outbound_task_once(
 async fn run_inbound_task_server_ws(
     identity: AgentIdentity,
     listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     local_services: Vec<String>,
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -2204,7 +1149,8 @@ async fn run_inbound_task_server_ws(
     relay_links: RelayLinkMap,
 ) -> Result<(), Error> {
     loop {
-        let peer = ws_mux::accept_mux_peer_on(identity.clone(), &listener).await?;
+        let peer =
+            ws_mux::accept_mux_peer_on(identity.clone(), &listener, tls_acceptor.clone()).await?;
         let identity = identity.clone();
         let local_services = local_services.clone();
         let hub = hub.clone();
@@ -2389,46 +1335,6 @@ async fn handle_inbound_task_peer_ws(
     Ok(())
 }
 
-fn default_artifact_extension(task_request: &TaskRequestConfig) -> &'static str {
-    match task_request.action {
-        crate::protocol::message::TaskAction::Screenshot => "png",
-        crate::protocol::message::TaskAction::FileDownload => "bin",
-        crate::protocol::message::TaskAction::Shell => "txt",
-        crate::protocol::message::TaskAction::FileUpload => "txt",
-    }
-}
-
-async fn maybe_store_task_artifact(
-    data_dir: &PathBuf,
-    task_request: &TaskRequestConfig,
-    result: &crate::protocol::message::TaskResultMessage,
-) -> Result<Option<PathBuf>, Error> {
-    let Some(data_hex) = result.data_hex.as_ref() else {
-        return Ok(None);
-    };
-    let bytes = data_encoding::HEXLOWER
-        .decode(data_hex.as_bytes())
-        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    let path = if let Some(save_path) = task_request.save_path.as_ref() {
-        save_path.clone()
-    } else {
-        let dir = data_dir.join("tasks");
-        tokio::fs::create_dir_all(&dir).await?;
-        dir.join(format!(
-            "{}.{}",
-            result.task_id,
-            default_artifact_extension(task_request)
-        ))
-    };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-    }
-    tokio::fs::write(&path, &bytes).await?;
-    Ok(Some(path))
-}
-
 async fn run_inbound_raw_once(
     identity: AgentIdentity,
     listener: TcpListener,
@@ -2496,11 +1402,12 @@ async fn run_inbound_raw_once(
 async fn run_inbound_raw_ws_once(
     identity: AgentIdentity,
     listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     raw_service_definition: ServiceDefinition,
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    let peer = ws_mux::accept_mux_peer(identity, listener).await?;
+    let peer = ws_mux::accept_mux_peer(identity, listener, tls_acceptor).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
     println!(
@@ -2932,15 +1839,18 @@ async fn run_outbound_once(
 
 #[cfg(test)]
 mod runtime_tests {
-    use super::{
-        handle_outbound_socks5_client, handle_outbound_socks5_ws_client,
-        handle_tcp_relay_stream_open, handle_ws_relay_stream_open, maybe_store_task_artifact,
-        print_status_snapshot, render_status_lines, write_status_snapshot, RelayStreamLink,
-        RuntimeStatusSnapshot,
-    };
+    use super::{handle_outbound_socks5_client, handle_outbound_socks5_ws_client};
     use crate::{
         agent::identity::AgentIdentity,
-        app::config::{AgentIdentityConfig, ServeEndpoint, StatusScope, TaskRequestConfig},
+        app::{
+            config::{AgentIdentityConfig, ServeEndpoint, StatusScope, TaskRequestConfig},
+            runtime_relay::{handle_tcp_relay_stream_open, handle_ws_relay_stream_open},
+            runtime_status::{
+                print_status_snapshot, render_status_lines, write_status_snapshot, RelayStreamLink,
+                RuntimeStatusSnapshot,
+            },
+            runtime_task::maybe_store_task_artifact,
+        },
         protocol::{
             frame::{Frame, MessageType},
             message::{
@@ -3244,7 +2154,7 @@ mod runtime_tests {
         });
 
         let target_task = tokio::spawn(async move {
-            let peer = accept_ws_mux_peer(target_identity, target_listener)
+            let peer = accept_ws_mux_peer(target_identity, target_listener, None)
                 .await
                 .unwrap();
             let (stream_id, open) = peer.read_stream_open().await.unwrap();
@@ -3264,7 +2174,7 @@ mod runtime_tests {
         });
 
         let relay_accept = tokio::spawn(async move {
-            accept_ws_mux_peer(relay_identity.clone(), relay_down_listener)
+            accept_ws_mux_peer(relay_identity.clone(), relay_down_listener, None)
                 .await
                 .unwrap()
         });
@@ -3498,7 +2408,7 @@ mod runtime_tests {
 
         let target_id = target_identity.id.clone();
         let target_task = tokio::spawn(async move {
-            let peer = accept_ws_mux_peer(target_identity, target_listener)
+            let peer = accept_ws_mux_peer(target_identity, target_listener, None)
                 .await
                 .unwrap();
             let (stream_id, open) = peer.read_stream_open().await.unwrap();
@@ -3518,7 +2428,7 @@ mod runtime_tests {
         });
 
         let relay_task = tokio::spawn(async move {
-            let downstream_peer = accept_ws_mux_peer(relay_identity, relay_listener)
+            let downstream_peer = accept_ws_mux_peer(relay_identity, relay_listener, None)
                 .await
                 .unwrap();
             let upstream_peer = connect_ws_mux_peer(

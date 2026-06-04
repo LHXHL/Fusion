@@ -15,6 +15,7 @@ use tokio::{
 
 use crate::{
     agent::identity::AgentIdentity,
+    crypto::transport::SharedKey,
     protocol::{
         frame::Frame,
         message::{Message, StreamOpenMessage},
@@ -24,7 +25,7 @@ use crate::{
         heartbeat::heartbeat_frame,
         peer::{PeerInfo, PeerSession, SessionState},
     },
-    tunnel::tcp::{read_frame, write_frame},
+    tunnel::tcp::{read_frame_with_key, write_frame_with_key},
 };
 
 #[derive(Debug, Default)]
@@ -41,12 +42,13 @@ pub struct MuxTcpPeer {
     routing: Arc<Mutex<StreamRoutingState>>,
     opens: Arc<Mutex<mpsc::Receiver<Frame>>>,
     controls: Arc<Mutex<mpsc::Receiver<Frame>>>,
+    shared_key: Option<SharedKey>,
 }
 
 impl MuxTcpPeer {
     pub async fn send_frame(&self, frame: &Frame) -> Result<(), Error> {
         let mut writer = self.writer.lock().await;
-        write_frame_half(&mut writer, frame).await
+        write_frame_half(&mut writer, frame, self.shared_key.as_ref()).await
     }
 
     pub async fn open_stream_receiver(&self, stream_id: u32) -> mpsc::Receiver<Frame> {
@@ -98,9 +100,13 @@ impl MuxTcpPeer {
     }
 }
 
-async fn write_frame_half(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<(), Error> {
+async fn write_frame_half(
+    writer: &mut OwnedWriteHalf,
+    frame: &Frame,
+    shared_key: Option<&SharedKey>,
+) -> Result<(), Error> {
     use tokio::io::AsyncWriteExt;
-    let payload = crate::protocol::codec::encode_frame(frame)?;
+    let payload = crate::crypto::transport::encode_transport_frame(frame, shared_key)?;
     let len = u32::try_from(payload.len())
         .map_err(|_| Error::new(ErrorKind::InvalidData, "frame too large"))?;
     writer.write_u32(len).await?;
@@ -109,23 +115,27 @@ async fn write_frame_half(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<
     Ok(())
 }
 
-async fn read_frame_half(reader: &mut OwnedReadHalf) -> Result<Frame, Error> {
+async fn read_frame_half(
+    reader: &mut OwnedReadHalf,
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error> {
     use tokio::io::AsyncReadExt;
     let len = reader.read_u32().await? as usize;
     let mut payload = vec![0_u8; len];
     reader.read_exact(&mut payload).await?;
-    crate::protocol::codec::decode_frame(&payload)
+    crate::crypto::transport::decode_transport_frame(&payload, shared_key)
 }
 
 async fn spawn_dispatch_loop(
     mut reader: OwnedReadHalf,
+    shared_key: Option<SharedKey>,
     routing: Arc<Mutex<StreamRoutingState>>,
     open_tx: mpsc::Sender<Frame>,
     control_tx: mpsc::Sender<Frame>,
 ) {
     tokio::spawn(async move {
         loop {
-            let frame = match read_frame_half(&mut reader).await {
+            let frame = match read_frame_half(&mut reader, shared_key.as_ref()).await {
                 Ok(frame) => frame,
                 Err(_) => break,
             };
@@ -172,12 +182,13 @@ pub async fn accept_mux_peer_on(
     listener: &TcpListener,
 ) -> Result<MuxTcpPeer, Error> {
     let (mut stream, addr) = listener.accept().await?;
-    let hello = read_frame(&mut stream).await?;
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
+    let hello = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     let session = complete_session(&identity, &hello)?;
     let ack = hello_ack_frame(&identity, Some(session.remote.agent_id.clone()));
-    write_frame(&mut stream, &ack).await?;
+    write_frame_with_key(&mut stream, &ack, shared_key.as_ref()).await?;
 
-    let heartbeat = read_frame(&mut stream).await?;
+    let heartbeat = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     if !matches!(heartbeat.message, Message::Heartbeat(_)) {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -185,13 +196,13 @@ pub async fn accept_mux_peer_on(
         ));
     }
     let heartbeat_ack = heartbeat_frame(identity.id.clone(), Some(session.remote.agent_id.clone()));
-    write_frame(&mut stream, &heartbeat_ack).await?;
+    write_frame_with_key(&mut stream, &heartbeat_ack, shared_key.as_ref()).await?;
 
     let (reader, writer) = stream.into_split();
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
 
     Ok(MuxTcpPeer {
         session,
@@ -200,6 +211,7 @@ pub async fn accept_mux_peer_on(
         routing,
         opens: Arc::new(Mutex::new(open_rx)),
         controls: Arc::new(Mutex::new(control_rx)),
+        shared_key,
     })
 }
 
@@ -209,10 +221,11 @@ pub async fn connect_mux_peer(
 ) -> Result<MuxTcpPeer, Error> {
     let mut stream = TcpStream::connect(endpoint).await?;
     let peer_addr = stream.peer_addr()?;
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
 
     let hello = hello_frame(&identity);
-    write_frame(&mut stream, &hello).await?;
-    let ack = read_frame(&mut stream).await?;
+    write_frame_with_key(&mut stream, &hello, shared_key.as_ref()).await?;
+    let ack = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     match &ack.message {
         Message::HelloAck(msg) if msg.accepted => {}
         _ => {
@@ -238,8 +251,8 @@ pub async fn connect_mux_peer(
     };
 
     let heartbeat = heartbeat_frame(identity.id.clone(), ack.header.src_agent.clone());
-    write_frame(&mut stream, &heartbeat).await?;
-    let heartbeat_ack = read_frame(&mut stream).await?;
+    write_frame_with_key(&mut stream, &heartbeat, shared_key.as_ref()).await?;
+    let heartbeat_ack = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     if !matches!(heartbeat_ack.message, Message::Heartbeat(_)) {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -251,7 +264,7 @@ pub async fn connect_mux_peer(
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
 
     Ok(MuxTcpPeer {
         session,
@@ -260,6 +273,7 @@ pub async fn connect_mux_peer(
         routing,
         opens: Arc::new(Mutex::new(open_rx)),
         controls: Arc::new(Mutex::new(control_rx)),
+        shared_key,
     })
 }
 
@@ -459,6 +473,45 @@ mod tests {
         let frame = server_task.await.unwrap();
         match frame.message {
             Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"buffered"),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mux_peer_routes_frames_by_stream_id_with_shared_key() {
+        let listener = bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("mux-server-keyed".into()),
+            key: Some("shared-secret".into()),
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("mux-client-keyed".into()),
+            key: Some("shared-secret".into()),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let peer = accept_mux_peer(server_identity, listener).await.unwrap();
+            let mut rx = peer.open_stream_receiver(9).await;
+            rx.recv().await.unwrap()
+        });
+
+        let peer = connect_mux_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
+        let frame = Frame::new(
+            MessageType::StreamData,
+            Some(peer.session.local.agent_id.clone()),
+            Some(peer.session.remote.agent_id.clone()),
+            Message::StreamData(StreamDataMessage::from_bytes(b"secure-mux")),
+        )
+        .with_stream_id(9);
+        peer.send_frame(&frame).await.unwrap();
+
+        let delivered = server_task.await.unwrap();
+        match delivered.message {
+            Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"secure-mux"),
             _ => panic!(),
         }
     }

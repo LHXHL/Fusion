@@ -1,8 +1,10 @@
 use std::io::{Error, ErrorKind};
 
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use crate::app::config::TunnelEndpoint;
+use crate::tunnel::tls::build_ws_tls_acceptor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerTransport {
@@ -14,6 +16,7 @@ pub struct BoundTunnelListener {
     pub transport: ListenerTransport,
     pub listener: TcpListener,
     pub display_url: String,
+    pub ws_tls_acceptor: Option<TlsAcceptor>,
 }
 
 pub async fn bind_endpoint(endpoint: &TunnelEndpoint) -> Result<BoundTunnelListener, Error> {
@@ -28,11 +31,13 @@ pub async fn bind_endpoint(endpoint: &TunnelEndpoint) -> Result<BoundTunnelListe
             transport: ListenerTransport::Tcp,
             listener,
             display_url: format!("tcp://{local_addr}"),
+            ws_tls_acceptor: None,
         }),
         "ws" | "wss" => Ok(BoundTunnelListener {
             transport: ListenerTransport::Ws,
             listener,
             display_url: format!("{}://{}{}", endpoint.url.scheme, local_addr, endpoint.url.path),
+            ws_tls_acceptor: build_ws_tls_acceptor(&endpoint.url)?,
         }),
         other => Err(Error::new(
             ErrorKind::InvalidInput,

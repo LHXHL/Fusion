@@ -70,7 +70,7 @@ service.exposed_count=1
 ### Tunnel
 - `tcp://`
 - `ws://`
-- `wss://`（仅保留入口与部分运行时分支，未作为完整 TLS 能力承诺）
+- `wss://`（支持显式 TLS 证书/私钥配置）
 
 ### Service
 - `socks5://HOST:PORT`
@@ -78,11 +78,46 @@ service.exposed_count=1
 - `raw://`
 - `port://LISTEN_HOST:LISTEN_PORT->TARGET_HOST:TARGET_PORT`
 
+其中：
+- `raw://HOST:PORT`：固定出口目标
+- `raw://`：动态出口目标，由上游请求决定最终连接地址
+
 ### Task
 - shell
 - screenshot
 - upload
 - download
+
+### 传输加密
+- `-k, --key <SECRET>`
+  - 对 `tcp://` / `ws://` / `wss://` 链路上的 **统一协议帧** 做预共享密钥加密
+  - 当前为**预共享密钥模式**
+  - 双端必须配置相同密钥，否则握手失败
+
+---
+
+### WSS / TLS
+
+`wss://` 通过 URL query 指定 TLS 参数：
+
+- 服务端监听：
+  - `tls-cert=/absolute/path/to/cert.pem`
+  - `tls-key=/absolute/path/to/key.pem`
+- 客户端连接：
+  - `tls-ca=/absolute/path/to/ca.pem`：附加自定义 CA
+  - `tls-insecure=1`：跳过证书与主机名校验（仅测试场景建议使用）
+
+示例：
+
+```bash
+cargo run --bin fusion -- \
+  -s "wss://0.0.0.0:8443/tunnel?tls-cert=/tmp/fusion-cert.pem&tls-key=/tmp/fusion-key.pem" \
+  -a wss-server
+
+cargo run --bin fusion -- \
+  -c "wss://localhost:8443/tunnel?tls-insecure=1" \
+  -a wss-client
+```
 
 ---
 
@@ -154,12 +189,47 @@ cp fusion.toml.example fusion.toml
 cargo run --bin fusion -- --config ./fusion.toml
 ```
 
+## 共享密钥（`-k`）
+
+`-k` 当前会对 Fusion 的传输帧进行统一封装：
+
+- hello / hello-ack / heartbeat
+- route / task
+- stream open / stream data / stream close
+
+适用链路：
+
+- `tcp://`
+- `ws://`
+- `wss://`
+
+示例：
+
+```bash
+cargo run --bin fusion -- \
+  -s tcp://0.0.0.0:34996 \
+  -k "my-shared-secret"
+
+cargo run --bin fusion -- \
+  -c tcp://127.0.0.1:34996 \
+  -k "my-shared-secret" \
+  task shell "whoami"
+```
+
+说明：
+
+- 当前 `-k` 是 **PSK（预共享密钥）模式**
+- 不做自动协商
+- 若双端密钥不一致，连接会在握手阶段失败
+- 当前加密粒度是 **Fusion 协议帧**，不是目标业务流量的额外独立 wrapper pipeline
+
 ---
 
 ## 当前未完全实现/边界说明
 
-- `wss://`：当前不承诺完整 TLS listener / cert 配置能力
-- `src/tunnel/tls.rs`：本轮未新增空壳模块
+- `wss://`：当前已支持显式证书/私钥配置，但 TLS 能力仍是精简版，暂未覆盖更完整的证书矩阵与双向认证场景
+- `src/tunnel/tls.rs`：当前为实际落地模块，不是空壳
+- `-k`：当前为预共享密钥的帧级加密，尚未扩展为设计文档中的完整 wrapper pipeline / 多算法可插拔体系
 - `src/crypto/wrapper.rs` / `src/utils/fs.rs`：本轮明确不补空壳文件
 - 当前协议错误传播未形成统一错误码体系
 

@@ -13,6 +13,7 @@
 |---|---|---|
 | `fusion --help` 可用 | `cargo run --bin fusion -- --help` | 已覆盖 |
 | URL 解析可用 | `src/utils/url.rs` 单元测试 | 已覆盖 |
+| `-k` 预共享密钥帧封装 | `src/crypto/transport.rs` 测试 | 已覆盖 |
 
 ## Phase 2
 
@@ -21,12 +22,14 @@
 | crypto 抽离 | `src/crypto/aead.rs` / `src/crypto/kex.rs` | 已覆盖 |
 | identity 抽离 | `src/agent/identity.rs` 测试 | 已覆盖 |
 | task capability 抽离 | `src/task/*` + `src/task/dispatcher.rs` 测试 | 已覆盖 |
+| runtime task artifact 抽离 | `src/app/runtime_task.rs` 测试 | 已覆盖 |
 
 ## Phase 3
 
 | 验收点 | 当前证据 | 状态 |
 |---|---|---|
 | hello / heartbeat / task echo | `src/tunnel/tcp.rs`、`src/tunnel/ws.rs`、`src/task/dispatcher.rs` 测试 | 已覆盖 |
+| keyed hello / frame exchange | `tcp_peer_can_exchange_frames_with_shared_key` / `ws_peer_can_exchange_frames_with_shared_key` | 已覆盖 |
 | frame codec roundtrip | `src/protocol/codec.rs` 测试 | 已覆盖 |
 
 ## Phase 4
@@ -35,6 +38,9 @@
 |---|---|---|
 | PeerSession / SessionHub | `src/session/peer.rs` / `src/session/hub.rs` | 已覆盖 |
 | reconnect 退避策略 | `src/session/reconnect.rs` 测试 | 已覆盖 |
+| runtime status/control 抽离 | `src/app/runtime_status.rs` + `runtime_status_snapshot_roundtrip` | 已覆盖 |
+| runtime relay/announce 抽离 | `src/app/runtime_relay.rs` + relay runtime tests | 已覆盖 |
+| listener/connect 模式分流抽离 | `src/app/runtime_mode.rs` 测试 | 已覆盖 |
 
 ## Phase 5
 
@@ -42,6 +48,8 @@
 |---|---|---|
 | TCP tunnel | `src/tunnel/tcp.rs` / `src/tunnel/tcp_mux.rs` 测试 | 已覆盖 |
 | WS tunnel | `src/tunnel/ws.rs` / `src/tunnel/ws_mux.rs` 测试 | 已覆盖 |
+| WSS tunnel | `wss_mux_handshake_and_stream_roundtrip_with_insecure_client` + `src/tunnel/tls.rs` 测试 | 已覆盖 |
+| keyed mux | `mux_peer_routes_frames_by_stream_id_with_shared_key` | 已覆盖 |
 | listener / dialer 抽象 | `src/tunnel/listener.rs` / `src/tunnel/dialer.rs` | 已覆盖 |
 
 ## Phase 6

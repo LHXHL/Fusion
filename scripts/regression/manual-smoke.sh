@@ -78,6 +78,31 @@ wait_for_log "$TCP_A_LOG" 'session.inbound.peer=' || fail "tcp inbound peer esta
 wait_for_file "$TCP_A_DIR/runtime-status.json" || fail "tcp runtime-status snapshot"
 pass "双节点 TCP 互连"
 
+KEY_A_DIR="$TMP_ROOT/key-a"
+mkdir -p "$KEY_A_DIR"
+KEY_A_LOG="$TMP_ROOT/key-a.log"
+LOGS+=("$KEY_A_LOG")
+
+cargo run --quiet --bin fusion -- \
+  --data-dir "$KEY_A_DIR" \
+  -s tcp://127.0.0.1:39098 \
+  -k smoke-shared-key \
+  -a smoke-key-a \
+  >"$KEY_A_LOG" 2>&1 &
+PIDS+=("$!")
+wait_for_log "$KEY_A_LOG" 'listen.active=tcp://127.0.0.1:39098' || fail "keyed tcp listener startup"
+
+KEY_TASK_LOG="$TMP_ROOT/key-task.log"
+LOGS+=("$KEY_TASK_LOG")
+cargo run --quiet --bin fusion -- \
+  -c tcp://127.0.0.1:39098 \
+  -k smoke-shared-key \
+  task shell 'echo fusion-key-smoke' \
+  >"$KEY_TASK_LOG" 2>&1
+grep -q 'task.result.ok=true' "$KEY_TASK_LOG" || fail "keyed task shell did not return ok=true"
+grep -q 'fusion-key-smoke' "$KEY_TASK_LOG" || fail "keyed task shell output mismatch"
+pass "共享密钥 TCP/task 链路"
+
 cargo run --quiet --bin fusion -- --data-dir "$TCP_A_DIR" peers list >/dev/null
 cargo run --quiet --bin fusion -- --data-dir "$TCP_A_DIR" routes list >/dev/null
 cargo run --quiet --bin fusion -- --data-dir "$TCP_A_DIR" services list >/dev/null

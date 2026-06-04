@@ -9,8 +9,8 @@ use tokio::{
 
 use crate::{
     agent::identity::AgentIdentity,
+    crypto::transport::{decode_transport_frame, encode_transport_frame, SharedKey},
     protocol::{
-        codec::{decode_frame, encode_frame},
         frame::Frame,
         message::Message,
     },
@@ -26,15 +26,16 @@ pub struct ActiveTcpPeer {
     pub session: PeerSession,
     pub peer_addr: SocketAddr,
     stream: TcpStream,
+    shared_key: Option<SharedKey>,
 }
 
 impl ActiveTcpPeer {
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), Error> {
-        write_frame(&mut self.stream, frame).await
+        write_frame_with_key(&mut self.stream, frame, self.shared_key.as_ref()).await
     }
 
     pub async fn read_frame(&mut self) -> Result<Frame, Error> {
-        read_frame(&mut self.stream).await
+        read_frame_with_key(&mut self.stream, self.shared_key.as_ref()).await
     }
 }
 
@@ -47,7 +48,15 @@ pub async fn connect(endpoint: &str) -> Result<TcpStream, Error> {
 }
 
 pub async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> Result<(), Error> {
-    let payload = encode_frame(frame)?;
+    write_frame_with_key(stream, frame, None).await
+}
+
+pub async fn write_frame_with_key(
+    stream: &mut TcpStream,
+    frame: &Frame,
+    shared_key: Option<&SharedKey>,
+) -> Result<(), Error> {
+    let payload = encode_transport_frame(frame, shared_key)?;
     let len = u32::try_from(payload.len())
         .map_err(|_| Error::new(ErrorKind::InvalidData, "frame too large"))?;
     stream.write_u32(len).await?;
@@ -57,10 +66,17 @@ pub async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> Result<(), Er
 }
 
 pub async fn read_frame(stream: &mut TcpStream) -> Result<Frame, Error> {
+    read_frame_with_key(stream, None).await
+}
+
+pub async fn read_frame_with_key(
+    stream: &mut TcpStream,
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error> {
     let len = stream.read_u32().await? as usize;
     let mut payload = vec![0_u8; len];
     stream.read_exact(&mut payload).await?;
-    decode_frame(&payload)
+    decode_transport_frame(&payload, shared_key)
 }
 
 pub async fn accept_peer(
@@ -75,12 +91,13 @@ pub async fn accept_peer_on(
     listener: &TcpListener,
 ) -> Result<ActiveTcpPeer, Error> {
     let (mut stream, addr) = listener.accept().await?;
-    let hello = read_frame(&mut stream).await?;
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
+    let hello = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     let session = complete_session(&identity, &hello)?;
     let ack = hello_ack_frame(&identity, Some(session.remote.agent_id.clone()));
-    write_frame(&mut stream, &ack).await?;
+    write_frame_with_key(&mut stream, &ack, shared_key.as_ref()).await?;
 
-    let heartbeat = read_frame(&mut stream).await?;
+    let heartbeat = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     if !matches!(heartbeat.message, Message::Heartbeat(_)) {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -89,24 +106,26 @@ pub async fn accept_peer_on(
     }
 
     let heartbeat_ack = heartbeat_frame(identity.id.clone(), Some(session.remote.agent_id.clone()));
-    write_frame(&mut stream, &heartbeat_ack).await?;
+    write_frame_with_key(&mut stream, &heartbeat_ack, shared_key.as_ref()).await?;
 
     info!("tcp inbound session active from {addr}");
     Ok(ActiveTcpPeer {
         session,
         peer_addr: addr,
         stream,
+        shared_key,
     })
 }
 
 pub async fn connect_peer(identity: AgentIdentity, endpoint: &str) -> Result<ActiveTcpPeer, Error> {
     let mut stream = connect(endpoint).await?;
     let peer_addr = stream.peer_addr()?;
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
 
     let hello = hello_frame(&identity);
-    write_frame(&mut stream, &hello).await?;
+    write_frame_with_key(&mut stream, &hello, shared_key.as_ref()).await?;
 
-    let ack = read_frame(&mut stream).await?;
+    let ack = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     match &ack.message {
         Message::HelloAck(msg) if msg.accepted => {}
         _ => {
@@ -132,8 +151,8 @@ pub async fn connect_peer(identity: AgentIdentity, endpoint: &str) -> Result<Act
     };
 
     let heartbeat = heartbeat_frame(identity.id.clone(), ack.header.src_agent.clone());
-    write_frame(&mut stream, &heartbeat).await?;
-    let heartbeat_ack = read_frame(&mut stream).await?;
+    write_frame_with_key(&mut stream, &heartbeat, shared_key.as_ref()).await?;
+    let heartbeat_ack = read_frame_with_key(&mut stream, shared_key.as_ref()).await?;
     if !matches!(heartbeat_ack.message, Message::Heartbeat(_)) {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -146,6 +165,7 @@ pub async fn connect_peer(identity: AgentIdentity, endpoint: &str) -> Result<Act
         session,
         peer_addr,
         stream,
+        shared_key,
     })
 }
 
@@ -270,5 +290,69 @@ mod tests {
 
         let server_session = server_task.await.unwrap();
         assert_eq!(server_session.remote.agent_name, "client-stream");
+    }
+
+    #[tokio::test]
+    async fn tcp_peer_can_exchange_frames_with_shared_key() {
+        let listener = bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("server-keyed".to_string()),
+            key: Some("shared-secret".to_string()),
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("client-keyed".to_string()),
+            key: Some("shared-secret".to_string()),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let mut peer = accept_peer(server_identity, listener).await.unwrap();
+            peer.read_frame().await.unwrap()
+        });
+
+        let mut client_peer = connect_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
+        let open = Frame::new(
+            MessageType::StreamOpen,
+            Some(client_peer.session.local.agent_id.clone()),
+            Some(client_peer.session.remote.agent_id.clone()),
+            Message::StreamOpen(StreamOpenMessage {
+                service: "raw".to_string(),
+                target_host: Some("keyed.example".to_string()),
+                target_port: Some(443),
+            }),
+        );
+        client_peer.send_frame(&open).await.unwrap();
+
+        let frame = server_task.await.unwrap();
+        match frame.message {
+            Message::StreamOpen(open) => {
+                assert_eq!(open.target_host.as_deref(), Some("keyed.example"));
+                assert_eq!(open.target_port, Some(443));
+            }
+            other => panic!("unexpected message: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_handshake_rejects_mismatched_shared_key_modes() {
+        let listener = bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("server-key-mismatch".to_string()),
+            key: Some("shared-secret".to_string()),
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("client-key-mismatch".to_string()),
+            key: None,
+        });
+
+        let server_task = tokio::spawn(async move { accept_peer(server_identity, listener).await });
+        let client_result = connect_peer(client_identity, &addr.to_string()).await;
+        assert!(client_result.is_err());
+        assert!(server_task.await.unwrap().is_err());
     }
 }

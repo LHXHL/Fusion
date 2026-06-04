@@ -16,17 +16,26 @@
 ### 2.1 已验证可用
 - `tcp://`
 - `ws://`
-
-### 2.2 已接入 URL/运行时分支，但未完全收口
 - `wss://`
+
+### 2.2 `wss://` 当前配置方式
 
 当前 `wss://` 的状态：
 - URL 解析支持
 - CLI 接受该 scheme
-- runtime 连接分支接受该 scheme
-- **未提供独立 TLS listener/server 收口模块**
-- **未声明完整证书配置矩阵**
-- 因此当前只能视为：**保留入口，不作为完全验收能力承诺**
+- runtime 监听/连接分支支持该 scheme
+- 已提供独立 TLS 收口模块：
+  - `/Users/qi4l/lang/Rust/Fusion-master/src/tunnel/tls.rs`
+- 服务端监听支持：
+  - `tls-cert=/absolute/path/to/cert.pem`
+  - `tls-key=/absolute/path/to/key.pem`
+- 客户端连接支持：
+  - `tls-ca=/absolute/path/to/ca.pem`
+  - `tls-insecure=1`
+
+说明：
+- 当前 TLS 能力已可用于本地/测试场景和显式 PEM 配置场景
+- 尚未扩展到更完整的双向认证、证书热更新、复杂证书来源矩阵
 
 ## 3. Service 类型
 
@@ -37,6 +46,10 @@
 - `raw://HOST:PORT`
 - `raw://`
 - `port://LISTEN_HOST:LISTEN_PORT->TARGET_HOST:TARGET_PORT`
+
+其中：
+- `raw://HOST:PORT` 表示固定出口目标
+- `raw://` 表示动态出口目标，由上游请求在运行时决定最终连接的 `host:port`
 
 说明：
 - `raw://` 用于动态目标
@@ -123,6 +136,8 @@
 - `fusion --help`
 - TCP 单跳互连
 - WS 单跳互连
+- WSS 单跳互连（单元测试）
+- `-k` 预共享密钥下的 TCP / WS / mux 链路（单元测试）
 - relay 基础转发
 - socks5 over relay
 - task shell/screenshot/upload/download
@@ -131,12 +146,23 @@
 
 ## 10. 已知限制
 
-### 10.1 `wss://` 未完全收口
-当前不承诺完整 TLS listener / cert 配置能力。
+### 10.1 `wss://` 仍属精简 TLS 配置面
+当前已支持显式证书/私钥与客户端 CA/insecure 模式，但仍未覆盖完整企业级 TLS 配置矩阵。
 
-### 10.2 结构上未新增以下计划文件
+### 10.2 `-k` 当前为预共享密钥帧级加密
+当前行为：
+- 对 Fusion 协议帧统一加密
+- 覆盖 hello / heartbeat / task / stream 等消息
+- 双端必须配置相同密钥
+
+当前未覆盖：
+- 自动密钥协商
+- wrapper pipeline
+- 多算法切换
+- 独立压缩 / padding 处理链
+
+### 10.3 结构上未新增以下计划文件
 本轮收尾**明确不补空壳文件**：
-- `src/tunnel/tls.rs`
 - `src/crypto/wrapper.rs`
 - `src/utils/fs.rs`
 
@@ -144,8 +170,16 @@
 - 当前没有实际功能依赖它们
 - 为避免“凑目录”式空模块，本轮以文档收口代替
 
-### 10.3 `protocol/stream.rs` / `agent/state.rs` / `tunnel/listener.rs` / `tunnel/dialer.rs`
+### 10.4 `protocol/stream.rs` / `agent/state.rs` / `tunnel/listener.rs` / `tunnel/dialer.rs`
 本轮已补上，用于让计划结构与实际工程更加一致。
+
+### 10.5 runtime 职责开始拆分
+当前仍以 `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime.rs` 为主入口，
+但以下职责已开始独立收口：
+- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_status.rs`
+- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_task.rs`
+- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_relay.rs`
+- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_mode.rs`
 
 ## 11. 快速验收命令
 

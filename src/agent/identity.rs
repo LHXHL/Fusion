@@ -7,13 +7,15 @@ use crate::{
 };
 use crate::utils::random::random_name;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AgentIdentity {
     pub id: String,
     pub name: String,
     pub hostname: String,
     pub os: String,
     pub arch: String,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    shared_key: Option<String>,
 }
 
 impl AgentIdentity {
@@ -28,11 +30,29 @@ impl AgentIdentity {
             hostname,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            shared_key: config.key.clone(),
         }
     }
 
     pub fn capability_labels(&self) -> Vec<String> {
         CapabilityRegistry::default_for_platform(&self.os, &self.arch).labels()
+    }
+
+    pub fn shared_key_secret(&self) -> Option<&str> {
+        self.shared_key.as_deref()
+    }
+}
+
+impl std::fmt::Debug for AgentIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentIdentity")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("hostname", &self.hostname)
+            .field("os", &self.os)
+            .field("arch", &self.arch)
+            .field("shared_key", &self.shared_key.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 

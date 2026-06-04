@@ -15,14 +15,16 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, Mutex},
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
-    accept_async, connect_async,
+    accept_async, connect_async, connect_async_tls_with_config,
     tungstenite::{self, Message as WsMessage},
-    MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 
 use crate::{
     agent::identity::AgentIdentity,
+    crypto::transport::{decode_transport_frame, encode_transport_frame, SharedKey},
     protocol::{
         frame::Frame,
         message::{Message, StreamOpenMessage},
@@ -32,6 +34,8 @@ use crate::{
         heartbeat::heartbeat_frame,
         peer::{PeerInfo, PeerSession, SessionState},
     },
+    tunnel::tls::build_ws_tls_connector,
+    utils::url::ParsedUrl,
 };
 
 type BoxWsSink = Pin<Box<dyn Sink<WsMessage, Error = tungstenite::Error> + Send>>;
@@ -51,11 +55,12 @@ pub struct MuxWsPeer {
     routing: Arc<Mutex<StreamRoutingState>>,
     opens: Arc<Mutex<mpsc::Receiver<Frame>>>,
     controls: Arc<Mutex<mpsc::Receiver<Frame>>>,
+    shared_key: Option<SharedKey>,
 }
 
 impl MuxWsPeer {
     pub async fn send_frame(&self, frame: &Frame) -> Result<(), Error> {
-        let payload = crate::protocol::codec::encode_frame(frame)?;
+        let payload = encode_transport_frame(frame, self.shared_key.as_ref())?;
         let mut writer = self.writer.lock().await;
         writer
             .send(WsMessage::Binary(payload.into()))
@@ -112,7 +117,10 @@ impl MuxWsPeer {
     }
 }
 
-async fn read_boxed_frame(stream: &mut BoxWsStream) -> Result<Frame, Error> {
+async fn read_boxed_frame(
+    stream: &mut BoxWsStream,
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error> {
     let msg = stream
         .next()
         .await
@@ -136,18 +144,19 @@ async fn read_boxed_frame(stream: &mut BoxWsStream) -> Result<Frame, Error> {
         }
     };
 
-    crate::protocol::codec::decode_frame(&bytes)
+    decode_transport_frame(&bytes, shared_key)
 }
 
 async fn spawn_dispatch_loop(
     mut reader: BoxWsStream,
+    shared_key: Option<SharedKey>,
     routing: Arc<Mutex<StreamRoutingState>>,
     open_tx: mpsc::Sender<Frame>,
     control_tx: mpsc::Sender<Frame>,
 ) {
     tokio::spawn(async move {
         loop {
-            let frame = match read_boxed_frame(&mut reader).await {
+            let frame = match read_boxed_frame(&mut reader, shared_key.as_ref()).await {
                 Ok(frame) => frame,
                 Err(_) => break,
             };
@@ -182,12 +191,10 @@ async fn spawn_dispatch_loop(
     });
 }
 
-fn split_boxed_tcp(ws: WebSocketStream<TcpStream>) -> (BoxWsSink, BoxWsStream) {
-    let (writer, reader): (SplitSink<_, _>, SplitStream<_>) = ws.split();
-    (Box::pin(writer), Box::pin(reader))
-}
-
-fn split_boxed_client(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> (BoxWsSink, BoxWsStream) {
+fn split_boxed<S>(ws: WebSocketStream<S>) -> (BoxWsSink, BoxWsStream)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     let (writer, reader): (SplitSink<_, _>, SplitStream<_>) = ws.split();
     (Box::pin(writer), Box::pin(reader))
 }
@@ -199,59 +206,52 @@ pub async fn bind(endpoint: &str) -> Result<TcpListener, Error> {
 pub async fn accept_mux_peer(
     identity: AgentIdentity,
     listener: TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<MuxWsPeer, Error> {
-    accept_mux_peer_on(identity, &listener).await
+    accept_mux_peer_on(identity, &listener, tls_acceptor).await
 }
 
 pub async fn accept_mux_peer_on(
     identity: AgentIdentity,
     listener: &TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<MuxWsPeer, Error> {
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
     let (stream, addr) = listener.accept().await?;
-    let mut ws_stream = accept_async(stream)
-        .await
-        .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
-
-    let hello = read_ws_frame(&mut ws_stream).await?;
-    let session = complete_session(&identity, &hello)?;
-    let ack = hello_ack_frame(&identity, Some(session.remote.agent_id.clone()));
-    write_ws_frame(&mut ws_stream, &ack).await?;
-
-    let heartbeat = read_ws_frame(&mut ws_stream).await?;
-    if !matches!(heartbeat.message, Message::Heartbeat(_)) {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "expected heartbeat after hello ack",
-        ));
+    match tls_acceptor {
+        Some(acceptor) => {
+            let tls_stream = acceptor.accept(stream).await.map_err(|e| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    format!("tls accept failed: {e}"),
+                )
+            })?;
+            let ws_stream = accept_async(tls_stream)
+                .await
+                .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
+            finish_accept_mux_peer(identity, shared_key, ws_stream, addr).await
+        }
+        None => {
+            let ws_stream = accept_async(stream)
+                .await
+                .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e.to_string()))?;
+            finish_accept_mux_peer(identity, shared_key, ws_stream, addr).await
+        }
     }
-    let heartbeat_ack = heartbeat_frame(identity.id.clone(), Some(session.remote.agent_id.clone()));
-    write_ws_frame(&mut ws_stream, &heartbeat_ack).await?;
-
-    let (writer, reader) = split_boxed_tcp(ws_stream);
-    let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
-    let (open_tx, open_rx) = mpsc::channel(64);
-    let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, routing.clone(), open_tx, control_tx).await;
-
-    Ok(MuxWsPeer {
-        session,
-        peer_addr: addr,
-        writer: Arc::new(Mutex::new(writer)),
-        routing,
-        opens: Arc::new(Mutex::new(open_rx)),
-        controls: Arc::new(Mutex::new(control_rx)),
-    })
 }
 
 pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result<MuxWsPeer, Error> {
-    let (mut ws_stream, _) = connect_async(endpoint)
+    let parsed = ParsedUrl::parse(endpoint)?;
+    let connector = build_ws_tls_connector(&parsed)?;
+    let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
+    let (mut ws_stream, _) = connect_ws(endpoint, connector)
         .await
         .map_err(|e| Error::new(ErrorKind::ConnectionRefused, e.to_string()))?;
     let peer_addr = peer_addr_from_client_ws(&ws_stream)?;
 
     let hello = hello_frame(&identity);
-    write_ws_frame(&mut ws_stream, &hello).await?;
-    let ack = read_ws_frame(&mut ws_stream).await?;
+    write_ws_frame(&mut ws_stream, &hello, shared_key.as_ref()).await?;
+    let ack = read_ws_frame(&mut ws_stream, shared_key.as_ref()).await?;
     match &ack.message {
         Message::HelloAck(msg) if msg.accepted => {}
         _ => {
@@ -277,8 +277,8 @@ pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result
     };
 
     let heartbeat = heartbeat_frame(identity.id.clone(), ack.header.src_agent.clone());
-    write_ws_frame(&mut ws_stream, &heartbeat).await?;
-    let heartbeat_ack = read_ws_frame(&mut ws_stream).await?;
+    write_ws_frame(&mut ws_stream, &heartbeat, shared_key.as_ref()).await?;
+    let heartbeat_ack = read_ws_frame(&mut ws_stream, shared_key.as_ref()).await?;
     if !matches!(heartbeat_ack.message, Message::Heartbeat(_)) {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -286,11 +286,11 @@ pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result
         ));
     }
 
-    let (writer, reader) = split_boxed_client(ws_stream);
+    let (writer, reader) = split_boxed(ws_stream);
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
 
     Ok(MuxWsPeer {
         session,
@@ -299,21 +299,29 @@ pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result
         routing,
         opens: Arc::new(Mutex::new(open_rx)),
         controls: Arc::new(Mutex::new(control_rx)),
+        shared_key,
     })
 }
 
-async fn write_ws_frame<S>(stream: &mut WebSocketStream<S>, frame: &Frame) -> Result<(), Error>
+async fn write_ws_frame<S>(
+    stream: &mut WebSocketStream<S>,
+    frame: &Frame,
+    shared_key: Option<&SharedKey>,
+) -> Result<(), Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let payload = crate::protocol::codec::encode_frame(frame)?;
+    let payload = encode_transport_frame(frame, shared_key)?;
     stream
         .send(WsMessage::Binary(payload.into()))
         .await
         .map_err(|e| Error::new(ErrorKind::BrokenPipe, e.to_string()))
 }
 
-async fn read_ws_frame<S>(stream: &mut WebSocketStream<S>) -> Result<Frame, Error>
+async fn read_ws_frame<S>(
+    stream: &mut WebSocketStream<S>,
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -340,24 +348,83 @@ where
         }
     };
 
-    crate::protocol::codec::decode_frame(&bytes)
+    decode_transport_frame(&bytes, shared_key)
 }
 
 fn peer_addr_from_client_ws(
     ws: &WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) -> Result<SocketAddr, Error> {
-    if let MaybeTlsStream::Plain(stream) = ws.get_ref() {
-        stream.peer_addr()
-    } else {
-        Err(Error::new(
+    match ws.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream.peer_addr(),
+        MaybeTlsStream::NativeTls(stream) => stream.get_ref().get_ref().get_ref().peer_addr(),
+        _ => Err(Error::new(
             ErrorKind::Unsupported,
-            "tls websocket peer_addr lookup is not wired yet",
-        ))
+            "unsupported websocket tls transport for peer_addr lookup",
+        )),
     }
+}
+
+async fn connect_ws(
+    endpoint: &str,
+    connector: Option<Connector>,
+) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), tungstenite::Error> {
+    if let Some(connector) = connector {
+        connect_async_tls_with_config(endpoint, None, false, Some(connector)).await
+    } else {
+        connect_async(endpoint).await
+    }
+}
+
+async fn finish_accept_mux_peer<S>(
+    identity: AgentIdentity,
+    shared_key: Option<SharedKey>,
+    mut ws_stream: WebSocketStream<S>,
+    addr: SocketAddr,
+) -> Result<MuxWsPeer, Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let hello = read_ws_frame(&mut ws_stream, shared_key.as_ref()).await?;
+    let session = complete_session(&identity, &hello)?;
+    let ack = hello_ack_frame(&identity, Some(session.remote.agent_id.clone()));
+    write_ws_frame(&mut ws_stream, &ack, shared_key.as_ref()).await?;
+
+    let heartbeat = read_ws_frame(&mut ws_stream, shared_key.as_ref()).await?;
+    if !matches!(heartbeat.message, Message::Heartbeat(_)) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "expected heartbeat after hello ack",
+        ));
+    }
+    let heartbeat_ack = heartbeat_frame(identity.id.clone(), Some(session.remote.agent_id.clone()));
+    write_ws_frame(&mut ws_stream, &heartbeat_ack, shared_key.as_ref()).await?;
+
+    let (writer, reader) = split_boxed(ws_stream);
+    let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
+    let (open_tx, open_rx) = mpsc::channel(64);
+    let (control_tx, control_rx) = mpsc::channel(64);
+    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
+
+    Ok(MuxWsPeer {
+        session,
+        peer_addr: addr,
+        writer: Arc::new(Mutex::new(writer)),
+        routing,
+        opens: Arc::new(Mutex::new(open_rx)),
+        controls: Arc::new(Mutex::new(control_rx)),
+        shared_key,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+
     use crate::{
         agent::identity::AgentIdentity,
         app::config::AgentIdentityConfig,
@@ -365,8 +432,28 @@ mod tests {
             frame::{Frame, MessageType},
             message::{Message, StreamDataMessage, StreamOpenMessage},
         },
+        tunnel::tls::build_ws_tls_acceptor,
         tunnel::ws_mux::{accept_mux_peer, bind, connect_mux_peer},
+        utils::url::ParsedUrl,
     };
+
+    fn temp_pem_path(stem: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("fusion-{stem}-{nanos}.pem"))
+    }
+
+    fn write_self_signed_cert() -> (std::path::PathBuf, std::path::PathBuf) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = temp_pem_path("wss-cert");
+        let key_path = temp_pem_path("wss-key");
+        fs::write(&cert_path, cert.pem()).unwrap();
+        fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
 
     #[tokio::test]
     async fn ws_mux_routes_frames_by_stream_id() {
@@ -382,7 +469,7 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let peer = accept_mux_peer(server_identity, listener).await.unwrap();
+            let peer = accept_mux_peer(server_identity, listener, None).await.unwrap();
             let mut rx1 = peer.open_stream_receiver(11).await;
             let mut rx2 = peer.open_stream_receiver(12).await;
             let a = tokio::spawn(async move { rx1.recv().await.unwrap() });
@@ -435,7 +522,7 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let peer = accept_mux_peer(server_identity, listener).await.unwrap();
+            let peer = accept_mux_peer(server_identity, listener, None).await.unwrap();
             let (stream_id, open) = peer.read_stream_open().await.unwrap();
             assert_eq!(stream_id, 21);
             assert_eq!(open.target_host.as_deref(), Some("buffer.ws"));
@@ -472,5 +559,65 @@ mod tests {
             Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"queued"),
             _ => panic!(),
         }
+    }
+
+    #[tokio::test]
+    async fn wss_mux_handshake_and_stream_roundtrip_with_insecure_client() {
+        let listener = bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cert_path, key_path) = write_self_signed_cert();
+        let acceptor = build_ws_tls_acceptor(
+            &ParsedUrl::parse(&format!(
+                "wss://127.0.0.1:{}/tunnel?tls-cert={}&tls-key={}",
+                addr.port(),
+                cert_path.display(),
+                key_path.display()
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("wss-mux-server".into()),
+            key: Some("shared-secret".into()),
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("wss-mux-client".into()),
+            key: Some("shared-secret".into()),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let peer = accept_mux_peer(server_identity, listener, acceptor).await.unwrap();
+            let mut rx = peer.open_stream_receiver(42).await;
+            rx.recv().await.unwrap()
+        });
+
+        let peer = connect_mux_peer(
+            client_identity,
+            &format!(
+                "wss://localhost:{}/tunnel?tls-insecure=1",
+                addr.port()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let data = Frame::new(
+            MessageType::StreamData,
+            Some(peer.session.local.agent_id.clone()),
+            Some(peer.session.remote.agent_id.clone()),
+            Message::StreamData(StreamDataMessage::from_bytes(b"secure")),
+        )
+        .with_stream_id(42);
+        peer.send_frame(&data).await.unwrap();
+
+        let frame = server_task.await.unwrap();
+        match frame.message {
+            Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"secure"),
+            _ => panic!(),
+        }
+
+        let _ = fs::remove_file(cert_path);
+        let _ = fs::remove_file(key_path);
     }
 }
