@@ -99,7 +99,11 @@ mod tests {
     #[test]
     fn inbound_mode_prefers_raw_only_when_no_local_services() {
         assert_eq!(
-            decide_inbound_runtime_mode(crate::tunnel::listener::ListenerTransport::Tcp, true, false),
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::Tcp,
+                true,
+                false
+            ),
             InboundRuntimeMode::RawTcp
         );
         assert_eq!(
@@ -117,13 +121,19 @@ mod tests {
             url: ParsedUrl::parse("ws://127.0.0.1:2/tunnel").unwrap(),
         };
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, Some(&crate::app::config::TaskRequestConfig {
-                action: crate::protocol::message::TaskAction::Shell,
-                args: vec![],
-                data_hex: None,
-                save_path: None,
-                target_agent_id: None,
-            }), false, false, false),
+            decide_outbound_runtime_mode(
+                &tcp,
+                Some(&crate::app::config::TaskRequestConfig {
+                    action: crate::protocol::message::TaskAction::Shell,
+                    args: vec![],
+                    data_hex: None,
+                    save_path: None,
+                    target_agent_id: None,
+                }),
+                false,
+                false,
+                false
+            ),
             OutboundRuntimeMode::Task
         );
         assert_eq!(

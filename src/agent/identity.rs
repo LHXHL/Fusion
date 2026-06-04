@@ -1,11 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    agent::capabilities::CapabilityRegistry,
-    app::config::AgentIdentityConfig,
-};
 use crate::utils::random::random_name;
+use crate::{agent::capabilities::CapabilityRegistry, app::config::AgentIdentityConfig};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentIdentity {
@@ -51,7 +48,10 @@ impl std::fmt::Debug for AgentIdentity {
             .field("hostname", &self.hostname)
             .field("os", &self.os)
             .field("arch", &self.arch)
-            .field("shared_key", &self.shared_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "shared_key",
+                &self.shared_key.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }

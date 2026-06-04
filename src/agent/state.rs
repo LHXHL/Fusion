@@ -21,7 +21,10 @@ impl AgentRuntimeState {
             format!("state.peer_count={}", self.peers.len()),
             format!("state.route_count={}", self.routes.len()),
             format!("state.stream_count={}", self.streams.len()),
-            format!("state.exposed_service_count={}", self.exposed_services.len()),
+            format!(
+                "state.exposed_service_count={}",
+                self.exposed_services.len()
+            ),
         ]
     }
 }

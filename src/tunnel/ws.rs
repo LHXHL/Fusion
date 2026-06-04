@@ -21,10 +21,7 @@ use tokio_tungstenite::{
 use crate::{
     agent::identity::AgentIdentity,
     crypto::transport::{decode_transport_frame, encode_transport_frame, SharedKey},
-    protocol::{
-        frame::Frame,
-        message::Message,
-    },
+    protocol::{frame::Frame, message::Message},
     session::{
         handshake::{complete_session, hello_ack_frame, hello_frame},
         heartbeat::heartbeat_frame,
@@ -261,7 +258,13 @@ pub async fn run_outbound_session_once(
 async fn connect_ws(
     endpoint: &str,
     connector: Option<Connector>,
-) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), tungstenite::Error> {
+) -> Result<
+    (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tungstenite::handshake::client::Response,
+    ),
+    tungstenite::Error,
+> {
     if let Some(connector) = connector {
         connect_async_tls_with_config(endpoint, None, false, Some(connector)).await
     } else {

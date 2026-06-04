@@ -3,18 +3,13 @@ use std::{collections::HashMap, time::SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    protocol::{message::AgentAnnounceMessage, route::RouteAnnouncement},
+    protocol::{
+        message::AgentAnnounceMessage,
+        route::{RouteAnnouncement, RouteHop},
+        stream::StreamLifecycle,
+    },
     session::peer::{PeerSession, SessionState},
 };
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StreamRuntimeState {
-    Opening,
-    Active,
-    Closing,
-    Closed,
-    Failed,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredStream {
@@ -22,7 +17,7 @@ pub struct RegisteredStream {
     pub peer_agent_id: String,
     pub service: String,
     pub target: String,
-    pub state: StreamRuntimeState,
+    pub state: StreamLifecycle,
     pub opened_at_unix: u64,
     pub closed_at_unix: Option<u64>,
     pub last_error: Option<String>,
@@ -40,6 +35,8 @@ pub struct RegisteredRoute {
     pub destination_agent_name: String,
     pub next_hop_agent_id: String,
     pub hop_count: usize,
+    #[serde(default)]
+    pub path: Vec<RouteHop>,
     pub services: Vec<String>,
     pub capabilities: Vec<String>,
     pub learned_at_unix: u64,
@@ -83,20 +80,17 @@ impl AgentRegistry {
     pub fn remove_peer_state(&mut self, peer_id: &str) {
         self.mark_peer_closed(peer_id);
         self.peers.remove(peer_id);
-        self.routes
-            .retain(|destination_agent_id, route| {
-                destination_agent_id != peer_id && route.next_hop_agent_id != peer_id
-            });
+        self.routes.retain(|destination_agent_id, route| {
+            destination_agent_id != peer_id && route.next_hop_agent_id != peer_id
+        });
         for stream in self.streams.values_mut() {
             if stream.peer_agent_id == peer_id
                 && matches!(
                     stream.state,
-                    StreamRuntimeState::Opening
-                        | StreamRuntimeState::Active
-                        | StreamRuntimeState::Closing
+                    StreamLifecycle::Opening | StreamLifecycle::Active | StreamLifecycle::Closing
                 )
             {
-                stream.state = StreamRuntimeState::Closed;
+                stream.state = StreamLifecycle::Closed;
                 stream.closed_at_unix = Some(unix_now());
                 if stream.last_error.is_none() {
                     stream.last_error = Some("peer disconnected".to_string());
@@ -106,36 +100,35 @@ impl AgentRegistry {
     }
 
     pub fn upsert_announce(&mut self, announce: &AgentAnnounceMessage, next_hop_agent_id: &str) {
-        self.routes.insert(
-            announce.agent_id.clone(),
-            RegisteredRoute {
-                destination_agent_id: announce.agent_id.clone(),
-                destination_agent_name: announce.agent_name.clone(),
-                next_hop_agent_id: next_hop_agent_id.to_string(),
-                hop_count: usize::from(announce.agent_id != next_hop_agent_id),
-                services: announce.services.clone(),
-                capabilities: announce.capabilities.clone(),
-                learned_at_unix: unix_now(),
-            },
-        );
+        self.upsert_route(RegisteredRoute {
+            destination_agent_id: announce.agent_id.clone(),
+            destination_agent_name: announce.agent_name.clone(),
+            next_hop_agent_id: next_hop_agent_id.to_string(),
+            hop_count: 1,
+            path: vec![RouteHop {
+                agent_id: next_hop_agent_id.to_string(),
+                agent_name: announce.agent_name.clone(),
+            }],
+            services: announce.services.clone(),
+            capabilities: announce.capabilities.clone(),
+            learned_at_unix: unix_now(),
+        });
     }
 
     pub fn upsert_route_announcement(&mut self, announcement: &RouteAnnouncement) {
         let Some(next_hop) = announcement.direct_next_hop() else {
             return;
         };
-        self.routes.insert(
-            announcement.origin_agent_id.clone(),
-            RegisteredRoute {
-                destination_agent_id: announcement.origin_agent_id.clone(),
-                destination_agent_name: announcement.origin_agent_name.clone(),
-                next_hop_agent_id: next_hop.agent_id.clone(),
-                hop_count: announcement.path.len(),
-                services: announcement.services.clone(),
-                capabilities: announcement.capabilities.clone(),
-                learned_at_unix: unix_now(),
-            },
-        );
+        self.upsert_route(RegisteredRoute {
+            destination_agent_id: announcement.origin_agent_id.clone(),
+            destination_agent_name: announcement.origin_agent_name.clone(),
+            next_hop_agent_id: next_hop.agent_id.clone(),
+            hop_count: announcement.path.len(),
+            path: announcement.path.clone(),
+            services: announcement.services.clone(),
+            capabilities: announcement.capabilities.clone(),
+            learned_at_unix: unix_now(),
+        });
     }
 
     pub fn next_hop_for(&self, destination_agent_id: &str) -> Option<&str> {
@@ -147,9 +140,8 @@ impl AgentRegistry {
     pub fn prune_stale_routes(&mut self, max_age_secs: u64) -> usize {
         let now = unix_now();
         let before = self.routes.len();
-        self.routes.retain(|_, route| {
-            now.saturating_sub(route.learned_at_unix) <= max_age_secs
-        });
+        self.routes
+            .retain(|_, route| now.saturating_sub(route.learned_at_unix) <= max_age_secs);
         before.saturating_sub(self.routes.len())
     }
 
@@ -191,7 +183,7 @@ impl AgentRegistry {
                 peer_agent_id,
                 service,
                 target,
-                state: StreamRuntimeState::Opening,
+                state: StreamLifecycle::Opening,
                 opened_at_unix: unix_now(),
                 closed_at_unix: None,
                 last_error: None,
@@ -200,29 +192,35 @@ impl AgentRegistry {
     }
 
     pub fn mark_stream_active(&mut self, stream_id: u32) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.state = StreamRuntimeState::Active;
-        }
+        self.set_stream_state(stream_id, StreamLifecycle::Active, None);
     }
 
     pub fn mark_stream_closing(&mut self, stream_id: u32) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.state = StreamRuntimeState::Closing;
-        }
+        self.set_stream_state(stream_id, StreamLifecycle::Closing, None);
     }
 
     pub fn mark_stream_closed(&mut self, stream_id: u32) {
-        if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.state = StreamRuntimeState::Closed;
-            stream.closed_at_unix = Some(unix_now());
-        }
+        self.set_stream_state(stream_id, StreamLifecycle::Closed, None);
     }
 
     pub fn mark_stream_failed(&mut self, stream_id: u32, error: impl Into<String>) {
+        self.set_stream_state(stream_id, StreamLifecycle::Failed, Some(error.into()));
+    }
+
+    fn set_stream_state(&mut self, stream_id: u32, state: StreamLifecycle, error: Option<String>) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.state = StreamRuntimeState::Failed;
-            stream.closed_at_unix = Some(unix_now());
-            stream.last_error = Some(error.into());
+            stream.state = state.clone();
+            match state {
+                StreamLifecycle::Closed | StreamLifecycle::Failed => {
+                    stream.closed_at_unix = Some(unix_now());
+                }
+                StreamLifecycle::Opening | StreamLifecycle::Active | StreamLifecycle::Closing => {
+                    stream.closed_at_unix = None;
+                }
+            }
+            if let Some(error) = error {
+                stream.last_error = Some(error);
+            }
         }
     }
 
@@ -244,9 +242,7 @@ impl AgentRegistry {
             .filter(|stream| {
                 matches!(
                     stream.state,
-                    StreamRuntimeState::Opening
-                        | StreamRuntimeState::Active
-                        | StreamRuntimeState::Closing
+                    StreamLifecycle::Opening | StreamLifecycle::Active | StreamLifecycle::Closing
                 )
             })
             .count()
@@ -280,11 +276,18 @@ impl AgentRegistry {
         let mut routes: Vec<_> = self.routes.values().cloned().collect();
         routes.sort_by(|a, b| a.destination_agent_id.cmp(&b.destination_agent_id));
         for route in routes {
+            let path = route
+                .path
+                .iter()
+                .map(|hop| hop.agent_id.as_str())
+                .collect::<Vec<_>>()
+                .join(">");
             lines.push(format!(
-                "registry.route={} next_hop={} hops={} services={}",
+                "registry.route={} next_hop={} hops={} path={} services={}",
                 route.destination_agent_id,
                 route.next_hop_agent_id,
                 route.hop_count,
+                path,
                 route.services.join(",")
             ));
         }
@@ -302,6 +305,28 @@ impl AgentRegistry {
     }
 }
 
+impl AgentRegistry {
+    fn upsert_route(&mut self, candidate: RegisteredRoute) {
+        let destination = candidate.destination_agent_id.clone();
+        match self.routes.get(&destination) {
+            Some(existing) if !should_replace_route(existing, &candidate) => {}
+            _ => {
+                self.routes.insert(destination, candidate);
+            }
+        }
+    }
+}
+
+fn should_replace_route(existing: &RegisteredRoute, candidate: &RegisteredRoute) -> bool {
+    if candidate.next_hop_agent_id == existing.next_hop_agent_id {
+        return true;
+    }
+
+    candidate.hop_count < existing.hop_count
+        || (candidate.hop_count == existing.hop_count
+            && candidate.next_hop_agent_id < existing.next_hop_agent_id)
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -312,14 +337,12 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        agent::{
-            identity::AgentIdentity,
-            registry::{AgentRegistry, StreamRuntimeState},
-        },
+        agent::{identity::AgentIdentity, registry::AgentRegistry},
         app::config::AgentIdentityConfig,
         protocol::{
             message::AgentAnnounceMessage,
             route::{RouteAnnouncement, RouteHop},
+            stream::StreamLifecycle,
         },
         session::peer::{PeerInfo, PeerSession, SessionState},
     };
@@ -353,7 +376,7 @@ mod tests {
         assert!(stream.contains("registry.stream=1"));
         assert!(matches!(
             registry.clone().streams.get(&1).unwrap().state,
-            StreamRuntimeState::Closed
+            StreamLifecycle::Closed
         ));
         assert!(matches!(
             registry.clone().peers.get("peer-1").unwrap().session.state,
@@ -369,6 +392,27 @@ mod tests {
         let summary = registry.summary_lines().join("\n");
         assert!(summary.contains("registry.stream=9"));
         assert!(summary.contains("state=Failed"));
+        let stream = registry.clone().streams.get(&9).unwrap().clone();
+        assert!(stream.closed_at_unix.is_some());
+        assert_eq!(stream.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn registry_clears_closed_at_when_stream_reactivates() {
+        let mut registry = AgentRegistry::new();
+        registry.open_stream(15, "peer-y".into(), "raw".into(), "example.com:80".into());
+        registry.mark_stream_failed(15, "temporary");
+        assert!(registry
+            .clone()
+            .streams
+            .get(&15)
+            .unwrap()
+            .closed_at_unix
+            .is_some());
+        registry.mark_stream_active(15);
+        let stream = registry.clone().streams.get(&15).unwrap().clone();
+        assert!(matches!(stream.state, StreamLifecycle::Active));
+        assert!(stream.closed_at_unix.is_none());
     }
 
     #[test]
@@ -389,15 +433,34 @@ mod tests {
             origin_agent_name: "peer-c-name".into(),
             capabilities: vec!["task:file-download".into()],
             services: vec!["task".into()],
-            path: vec![RouteHop {
-                agent_id: "peer-b".into(),
-                agent_name: "peer-b-name".into(),
-            }],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+            ],
         });
 
         assert_eq!(registry.route_count(), 2);
         assert_eq!(registry.next_hop_for("peer-a"), Some("peer-a"));
         assert_eq!(registry.next_hop_for("peer-c"), Some("peer-b"));
+        assert_eq!(
+            registry.clone().routes.get("peer-c").unwrap().path,
+            vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+            ]
+        );
         let summary = registry.summary_lines().join("\n");
         assert!(summary.contains("registry.route=peer-c next_hop=peer-b"));
         assert!(summary.contains("registry.local_service=socks5://127.0.0.1:1080"));
@@ -432,10 +495,16 @@ mod tests {
             origin_agent_name: "peer-c-name".into(),
             capabilities: vec!["task:file-download".into()],
             services: vec!["task".into()],
-            path: vec![RouteHop {
-                agent_id: "peer-b".into(),
-                agent_name: "peer-b-name".into(),
-            }],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+            ],
         });
         registry.open_stream(11, "peer-b".into(), "raw".into(), "dynamic".into());
         registry.mark_stream_active(11);
@@ -468,10 +537,16 @@ mod tests {
             origin_agent_name: "peer-stale-name".into(),
             capabilities: vec!["task:file-download".into()],
             services: vec!["task".into()],
-            path: vec![RouteHop {
-                agent_id: "relay-x".into(),
-                agent_name: "relay-x-name".into(),
-            }],
+            path: vec![
+                RouteHop {
+                    agent_id: "relay-x".into(),
+                    agent_name: "relay-x-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-stale".into(),
+                    agent_name: "peer-stale-name".into(),
+                },
+            ],
         });
 
         {
@@ -484,5 +559,108 @@ mod tests {
         assert_eq!(registry.route_count(), 1);
         assert_eq!(registry.next_hop_for("peer-live"), Some("peer-live"));
         assert_eq!(registry.next_hop_for("peer-stale"), None);
+    }
+
+    #[test]
+    fn registry_prefers_shorter_route_and_keeps_tie_break_stable() {
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-d".into(),
+                    agent_name: "peer-d-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+    }
+
+    #[test]
+    fn registry_recovers_route_after_next_hop_disconnect_and_refresh() {
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+
+        registry.remove_peer_state("peer-b");
+        assert_eq!(registry.next_hop_for("peer-z"), None);
+
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-y".into(),
+                    agent_name: "peer-y-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-c"));
     }
 }

@@ -36,7 +36,10 @@ pub async fn bind_endpoint(endpoint: &TunnelEndpoint) -> Result<BoundTunnelListe
         "ws" | "wss" => Ok(BoundTunnelListener {
             transport: ListenerTransport::Ws,
             listener,
-            display_url: format!("{}://{}{}", endpoint.url.scheme, local_addr, endpoint.url.path),
+            display_url: format!(
+                "{}://{}{}",
+                endpoint.url.scheme, local_addr, endpoint.url.path
+            ),
             ws_tls_acceptor: build_ws_tls_acceptor(&endpoint.url)?,
         }),
         other => Err(Error::new(

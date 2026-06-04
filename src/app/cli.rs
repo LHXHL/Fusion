@@ -190,8 +190,8 @@ impl CliArgs {
     pub fn parse_config() -> Result<AppConfig, Error> {
         let matches = Self::command().get_matches();
         let value_sources = CliValueSources::from_matches(&matches);
-        let args =
-            Self::from_arg_matches(&matches).map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
+        let args = Self::from_arg_matches(&matches)
+            .map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
         build_app_config(args, value_sources)
     }
 }
@@ -232,7 +232,8 @@ impl CliValueSources {
             agent_name: matches.value_source("agent_name") == Some(ValueSource::CommandLine),
             key: matches.value_source("key") == Some(ValueSource::CommandLine),
             retry: matches.value_source("retry") == Some(ValueSource::CommandLine),
-            retry_interval: matches.value_source("retry_interval") == Some(ValueSource::CommandLine),
+            retry_interval: matches.value_source("retry_interval")
+                == Some(ValueSource::CommandLine),
             retry_max_interval: matches.value_source("retry_max_interval")
                 == Some(ValueSource::CommandLine),
             data_dir: matches.value_source("data_dir") == Some(ValueSource::CommandLine),
@@ -262,12 +263,16 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
     let local_serves = choose_string_list(
         &value.local_serves,
         value_sources.local_serves,
-        file_config.as_ref().and_then(|cfg| cfg.local_serves.as_ref()),
+        file_config
+            .as_ref()
+            .and_then(|cfg| cfg.local_serves.as_ref()),
     );
     let remote_serves = choose_string_list(
         &value.remote_serves,
         value_sources.remote_serves,
-        file_config.as_ref().and_then(|cfg| cfg.remote_serves.as_ref()),
+        file_config
+            .as_ref()
+            .and_then(|cfg| cfg.remote_serves.as_ref()),
     );
 
     let retry = merged_retry_policy(&value, value_sources, file_config.as_ref());
@@ -296,22 +301,28 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
         remote_peer_id: choose_option_string(
             value.remote_peer,
             value_sources.remote_peer,
-            file_config.as_ref().and_then(|cfg| cfg.remote_peer_id.clone()),
+            file_config
+                .as_ref()
+                .and_then(|cfg| cfg.remote_peer_id.clone()),
         ),
         identity: AgentIdentityConfig {
             name: choose_option_string(
                 value.agent_name,
                 value_sources.agent_name,
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.identity.as_ref().and_then(|identity| identity.name.clone())),
+                file_config.as_ref().and_then(|cfg| {
+                    cfg.identity
+                        .as_ref()
+                        .and_then(|identity| identity.name.clone())
+                }),
             ),
             key: choose_option_string(
                 value.key,
                 value_sources.key,
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.identity.as_ref().and_then(|identity| identity.key.clone())),
+                file_config.as_ref().and_then(|cfg| {
+                    cfg.identity
+                        .as_ref()
+                        .and_then(|identity| identity.key.clone())
+                }),
             ),
         },
         retry,
@@ -338,7 +349,10 @@ fn resolve_config_file(
 ) -> Result<Option<PathBuf>, Error> {
     if value_sources.config {
         let path = value.config.clone().ok_or_else(|| {
-            Error::new(ErrorKind::InvalidInput, "--config was provided without a path")
+            Error::new(
+                ErrorKind::InvalidInput,
+                "--config was provided without a path",
+            )
         })?;
         return Ok(Some(path));
     }
@@ -692,7 +706,10 @@ mod tests {
         let args = CliArgs::parse_from(["fusion", "--data-dir", ".fusion", "status", "routes"]);
         let cfg = AppConfig::try_from(args).unwrap();
         let status = cfg.status_command.unwrap();
-        assert!(matches!(status.scope, crate::app::config::StatusScope::Routes));
+        assert!(matches!(
+            status.scope,
+            crate::app::config::StatusScope::Routes
+        ));
         assert!(!status.json);
         assert!(cfg.task_request.is_none());
     }

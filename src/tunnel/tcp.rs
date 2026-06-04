@@ -10,10 +10,7 @@ use tokio::{
 use crate::{
     agent::identity::AgentIdentity,
     crypto::transport::{decode_transport_frame, encode_transport_frame, SharedKey},
-    protocol::{
-        frame::Frame,
-        message::Message,
-    },
+    protocol::{frame::Frame, message::Message},
     session::{
         handshake::{complete_session, hello_ack_frame, hello_frame},
         heartbeat::heartbeat_frame,

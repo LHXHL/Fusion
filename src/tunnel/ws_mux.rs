@@ -290,7 +290,14 @@ pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(
+        reader,
+        shared_key.clone(),
+        routing.clone(),
+        open_tx,
+        control_tx,
+    )
+    .await;
 
     Ok(MuxWsPeer {
         session,
@@ -367,7 +374,13 @@ fn peer_addr_from_client_ws(
 async fn connect_ws(
     endpoint: &str,
     connector: Option<Connector>,
-) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::handshake::client::Response), tungstenite::Error> {
+) -> Result<
+    (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tungstenite::handshake::client::Response,
+    ),
+    tungstenite::Error,
+> {
     if let Some(connector) = connector {
         connect_async_tls_with_config(endpoint, None, false, Some(connector)).await
     } else {
@@ -403,7 +416,14 @@ where
     let routing = Arc::new(Mutex::new(StreamRoutingState::default()));
     let (open_tx, open_rx) = mpsc::channel(64);
     let (control_tx, control_rx) = mpsc::channel(64);
-    spawn_dispatch_loop(reader, shared_key.clone(), routing.clone(), open_tx, control_tx).await;
+    spawn_dispatch_loop(
+        reader,
+        shared_key.clone(),
+        routing.clone(),
+        open_tx,
+        control_tx,
+    )
+    .await;
 
     Ok(MuxWsPeer {
         session,
@@ -423,7 +443,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rcgen::generate_simple_self_signed;
 
     use crate::{
         agent::identity::AgentIdentity,
@@ -446,12 +466,11 @@ mod tests {
     }
 
     fn write_self_signed_cert() -> (std::path::PathBuf, std::path::PathBuf) {
-        let CertifiedKey { cert, key_pair } =
-            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_path = temp_pem_path("wss-cert");
         let key_path = temp_pem_path("wss-key");
-        fs::write(&cert_path, cert.pem()).unwrap();
-        fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        fs::write(&cert_path, cert.serialize_pem().unwrap()).unwrap();
+        fs::write(&key_path, cert.serialize_private_key_pem()).unwrap();
         (cert_path, key_path)
     }
 
@@ -469,7 +488,9 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let peer = accept_mux_peer(server_identity, listener, None).await.unwrap();
+            let peer = accept_mux_peer(server_identity, listener, None)
+                .await
+                .unwrap();
             let mut rx1 = peer.open_stream_receiver(11).await;
             let mut rx2 = peer.open_stream_receiver(12).await;
             let a = tokio::spawn(async move { rx1.recv().await.unwrap() });
@@ -522,7 +543,9 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let peer = accept_mux_peer(server_identity, listener, None).await.unwrap();
+            let peer = accept_mux_peer(server_identity, listener, None)
+                .await
+                .unwrap();
             let (stream_id, open) = peer.read_stream_open().await.unwrap();
             assert_eq!(stream_id, 21);
             assert_eq!(open.target_host.as_deref(), Some("buffer.ws"));
@@ -587,17 +610,16 @@ mod tests {
         });
 
         let server_task = tokio::spawn(async move {
-            let peer = accept_mux_peer(server_identity, listener, acceptor).await.unwrap();
+            let peer = accept_mux_peer(server_identity, listener, acceptor)
+                .await
+                .unwrap();
             let mut rx = peer.open_stream_receiver(42).await;
             rx.recv().await.unwrap()
         });
 
         let peer = connect_mux_peer(
             client_identity,
-            &format!(
-                "wss://localhost:{}/tunnel?tls-insecure=1",
-                addr.port()
-            ),
+            &format!("wss://localhost:{}/tunnel?tls-insecure=1", addr.port()),
         )
         .await
         .unwrap();

@@ -79,10 +79,16 @@ mod tests {
             origin_agent_name: "peer-c-name".into(),
             capabilities: vec!["task:shell".into()],
             services: vec!["task".into()],
-            path: vec![RouteHop {
-                agent_id: "peer-b".into(),
-                agent_name: "peer-b-name".into(),
-            }],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+            ],
         });
         let frame = Frame::new(
             MessageType::Hello,

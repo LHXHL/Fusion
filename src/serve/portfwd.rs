@@ -37,11 +37,9 @@ impl PortForwardService {
                 "port forward service missing listen port",
             )
         })?;
-        let target_host = url
-            .query
-            .get("target_host")
-            .cloned()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "port forward missing target_host"))?;
+        let target_host = url.query.get("target_host").cloned().ok_or_else(|| {
+            Error::new(ErrorKind::InvalidInput, "port forward missing target_host")
+        })?;
         let target_port = url
             .query
             .get("target_port")
@@ -83,7 +81,10 @@ impl PortForwardService {
     }
 }
 
-pub async fn proxy_connection(mut inbound: TcpStream, service: PortForwardService) -> Result<(), Error> {
+pub async fn proxy_connection(
+    mut inbound: TcpStream,
+    service: PortForwardService,
+) -> Result<(), Error> {
     let mut outbound = service.connect_target().await?;
     let _ = copy_bidirectional(&mut inbound, &mut outbound).await?;
     Ok(())

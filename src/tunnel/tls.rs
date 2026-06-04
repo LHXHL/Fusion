@@ -28,7 +28,12 @@ pub fn build_ws_tls_acceptor(url: &ParsedUrl) -> Result<Option<TlsAcceptor>, Err
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|err| Error::new(ErrorKind::InvalidInput, format!("invalid tls cert/key: {err}")))?;
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid tls cert/key: {err}"),
+            )
+        })?;
 
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
@@ -128,7 +133,10 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use rcgen::generate_simple_self_signed;
 
@@ -153,7 +161,7 @@ mod tests {
     #[test]
     fn wss_connector_supports_insecure_and_custom_ca() {
         let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_pem = cert.cert.pem();
+        let cert_pem = cert.serialize_pem().unwrap();
         let cert_path = temp_file("ca");
         fs::write(&cert_path, cert_pem).unwrap();
 

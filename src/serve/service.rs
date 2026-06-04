@@ -96,9 +96,12 @@ pub fn validate_service_pairing(
     let has_local_socks5 = local
         .iter()
         .any(|s| matches!(s.kind, ServiceKind::LocalSocks5(_)));
-    let has_supported_remote_egress = remote
-        .iter()
-        .any(|s| matches!(s.kind, ServiceKind::RemoteRaw(_) | ServiceKind::RemotePortForward(_)));
+    let has_supported_remote_egress = remote.iter().any(|s| {
+        matches!(
+            s.kind,
+            ServiceKind::RemoteRaw(_) | ServiceKind::RemotePortForward(_)
+        )
+    });
 
     if has_local_socks5 && !has_supported_remote_egress {
         return Err(Error::new(
