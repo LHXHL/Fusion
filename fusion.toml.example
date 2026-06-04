@@ -1,0 +1,14 @@
+listens = ["tcp://0.0.0.0:34996"]
+connects = []
+local_serves = []
+remote_serves = []
+remote_peer_id = ""
+data_dir = ".fusion"
+log_level = "info"
+
+[identity]
+name = "node-a"
+
+[retry]
+interval_secs = 10
+max_interval_secs = 300
