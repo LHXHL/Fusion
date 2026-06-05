@@ -46,6 +46,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
     let (
         inbound_raw_service,
         outbound_socks5_service,
+        outbound_http_proxy_service,
         outbound_egress_service,
         remote_port_forward_services,
     ) = find_runtime_services(&prepared.local_services, &prepared.remote_services);
@@ -68,6 +69,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         &identity,
         &shared,
         outbound_socks5_service,
+        outbound_http_proxy_service,
         outbound_egress_service,
         &prepared.exposed_service_labels,
     ));

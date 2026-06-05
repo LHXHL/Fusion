@@ -127,6 +127,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_udp_url() {
+        let parsed = ParsedUrl::parse("udp://127.0.0.1:5353").unwrap();
+        assert_eq!(parsed.scheme, "udp");
+        assert_eq!(parsed.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.port, Some(5353));
+    }
+
+    #[test]
     fn parse_port_forward_url() {
         let parsed = ParsedUrl::parse("port://127.0.0.1:8080->example.com:80").unwrap();
         assert_eq!(parsed.scheme, "port");

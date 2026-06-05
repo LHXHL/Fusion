@@ -13,6 +13,7 @@ pub enum InboundRuntimeMode {
     TaskTcp,
     RawWs,
     TaskWs,
+    DirectUdp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub enum OutboundRuntimeMode {
     Task,
     Socks5Tcp,
     Socks5Ws,
+    HttpProxyTcp,
+    HttpProxyWs,
     RelayTcp,
     RelayWs,
     Direct,
@@ -47,6 +50,7 @@ pub fn decide_inbound_runtime_mode(
         (ListenerTransport::Tcp, _, _) => InboundRuntimeMode::TaskTcp,
         (ListenerTransport::Ws, true, false) => InboundRuntimeMode::RawWs,
         (ListenerTransport::Ws, _, _) => InboundRuntimeMode::TaskWs,
+        (ListenerTransport::Udp, _, _) => InboundRuntimeMode::DirectUdp,
     }
 }
 
@@ -54,6 +58,7 @@ pub fn decide_outbound_runtime_mode(
     endpoint: &TunnelEndpoint,
     task_request: Option<&TaskRequestConfig>,
     has_local_socks: bool,
+    has_local_http_proxy: bool,
     has_remote_egress: bool,
     has_listener: bool,
 ) -> OutboundRuntimeMode {
@@ -69,6 +74,12 @@ pub fn decide_outbound_runtime_mode(
     }
     if is_ws && has_local_socks && has_remote_egress {
         return OutboundRuntimeMode::Socks5Ws;
+    }
+    if is_tcp && has_local_http_proxy && has_remote_egress {
+        return OutboundRuntimeMode::HttpProxyTcp;
+    }
+    if is_ws && has_local_http_proxy && has_remote_egress {
+        return OutboundRuntimeMode::HttpProxyWs;
     }
     if is_tcp && has_listener {
         return OutboundRuntimeMode::RelayTcp;
@@ -110,15 +121,22 @@ mod tests {
             decide_inbound_runtime_mode(crate::tunnel::listener::ListenerTransport::Ws, true, true),
             InboundRuntimeMode::TaskWs
         );
+        assert_eq!(
+            decide_inbound_runtime_mode(crate::tunnel::listener::ListenerTransport::Udp, false, false),
+            InboundRuntimeMode::DirectUdp
+        );
     }
 
     #[test]
-    fn outbound_mode_covers_task_socks_relay_and_direct() {
+    fn outbound_mode_covers_task_socks_http_relay_and_direct() {
         let tcp = TunnelEndpoint {
             url: ParsedUrl::parse("tcp://127.0.0.1:1").unwrap(),
         };
         let ws = TunnelEndpoint {
             url: ParsedUrl::parse("ws://127.0.0.1:2/tunnel").unwrap(),
+        };
+        let udp = TunnelEndpoint {
+            url: ParsedUrl::parse("udp://127.0.0.1:3").unwrap(),
         };
         assert_eq!(
             decide_outbound_runtime_mode(
@@ -132,24 +150,33 @@ mod tests {
                 }),
                 false,
                 false,
+                false,
                 false
             ),
             OutboundRuntimeMode::Task
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, true, true, false),
+            decide_outbound_runtime_mode(&tcp, None, true, false, true, false),
             OutboundRuntimeMode::Socks5Tcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, true, true, false),
+            decide_outbound_runtime_mode(&ws, None, true, false, true, false),
             OutboundRuntimeMode::Socks5Ws
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, false, true),
+            decide_outbound_runtime_mode(&tcp, None, false, true, true, false),
+            OutboundRuntimeMode::HttpProxyTcp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&ws, None, false, true, true, false),
+            OutboundRuntimeMode::HttpProxyWs
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&tcp, None, false, false, false, true),
             OutboundRuntimeMode::RelayTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, false, false, false),
+            decide_outbound_runtime_mode(&udp, None, false, false, false, true),
             OutboundRuntimeMode::Direct
         );
     }

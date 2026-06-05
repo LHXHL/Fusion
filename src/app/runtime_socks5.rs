@@ -5,10 +5,17 @@ use std::{
 
 use crate::{
     agent::{identity::AgentIdentity, registry::AgentRegistry},
-    app::{config::TunnelEndpoint, runtime::build_stream_target_label},
+    app::{
+        config::TunnelEndpoint,
+        runtime::build_stream_target_label,
+        runtime_bridge::{
+            build_stream_close_frame, build_stream_data_frame, expect_stream_close_ack,
+            write_next_stream_data_to_client,
+        },
+    },
     protocol::{
         frame::{Frame, MessageType},
-        message::{Message, StreamCloseMessage, StreamDataMessage},
+        message::Message,
     },
     serve::{
         service::{build_remote_stream_open_for_request, ServiceDefinition, ServiceKind},
@@ -18,7 +25,7 @@ use crate::{
     tunnel::{tcp_mux, ws_mux},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -132,68 +139,25 @@ pub async fn handle_outbound_socks5_client(
             break;
         }
 
-        let payload = Frame::new(
-            MessageType::StreamData,
-            Some(peer.session.local.agent_id.clone()),
-            Some(peer.session.remote.agent_id.clone()),
-            Message::StreamData(StreamDataMessage::from_bytes(&buf[..n])),
-        )
-        .with_stream_id(stream_id);
+        let payload = build_stream_data_frame(
+            &peer.session.local.agent_id,
+            &peer.session.remote.agent_id,
+            stream_id,
+            &buf[..n],
+        );
         peer.send_frame(&payload).await?;
-
-        let response = rx
-            .recv()
-            .await
-            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "stream receiver closed"))?;
-        if response.header.stream_id != Some(stream_id) {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "unexpected stream_id on socks5 response",
-            ));
-        }
-        match response.message {
-            Message::StreamData(data) => {
-                let bytes = data.to_bytes()?;
-                client.write_all(&bytes).await?;
-                client.flush().await?;
-            }
-            other => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("expected StreamData response, got {:?}", other),
-                ))
-            }
-        }
+        write_next_stream_data_to_client(&mut rx, &mut client, stream_id, "socks5").await?;
     }
 
-    let close = Frame::new(
-        MessageType::StreamClose,
-        Some(peer.session.local.agent_id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::StreamClose(StreamCloseMessage { reason: None }),
-    )
-    .with_stream_id(stream_id);
+    let close = build_stream_close_frame(
+        &peer.session.local.agent_id,
+        &peer.session.remote.agent_id,
+        stream_id,
+    );
     peer.send_frame(&close).await?;
-    let close_ack = rx
-        .recv()
-        .await
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "close ack receiver closed"))?;
-    if close_ack.header.stream_id != Some(stream_id) {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "unexpected stream_id on close ack",
-        ));
-    }
-    match close_ack.message {
-        Message::StreamClose(_) => {
-            registry.lock().await.mark_stream_closed(stream_id);
-            Ok(())
-        }
-        other => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected StreamClose ack, got {:?}", other),
-        )),
-    }
+    expect_stream_close_ack(&mut rx, stream_id).await?;
+    registry.lock().await.mark_stream_closed(stream_id);
+    Ok(())
 }
 
 pub async fn run_outbound_socks5_ws_once(
@@ -295,66 +259,23 @@ pub async fn handle_outbound_socks5_ws_client(
             break;
         }
 
-        let payload = Frame::new(
-            MessageType::StreamData,
-            Some(peer.session.local.agent_id.clone()),
-            Some(peer.session.remote.agent_id.clone()),
-            Message::StreamData(StreamDataMessage::from_bytes(&buf[..n])),
-        )
-        .with_stream_id(stream_id);
+        let payload = build_stream_data_frame(
+            &peer.session.local.agent_id,
+            &peer.session.remote.agent_id,
+            stream_id,
+            &buf[..n],
+        );
         peer.send_frame(&payload).await?;
-
-        let response = rx
-            .recv()
-            .await
-            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "stream receiver closed"))?;
-        if response.header.stream_id != Some(stream_id) {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "unexpected stream_id on socks5 response",
-            ));
-        }
-        match response.message {
-            Message::StreamData(data) => {
-                let bytes = data.to_bytes()?;
-                client.write_all(&bytes).await?;
-                client.flush().await?;
-            }
-            other => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("expected StreamData response, got {:?}", other),
-                ))
-            }
-        }
+        write_next_stream_data_to_client(&mut rx, &mut client, stream_id, "socks5").await?;
     }
 
-    let close = Frame::new(
-        MessageType::StreamClose,
-        Some(peer.session.local.agent_id.clone()),
-        Some(peer.session.remote.agent_id.clone()),
-        Message::StreamClose(StreamCloseMessage { reason: None }),
-    )
-    .with_stream_id(stream_id);
+    let close = build_stream_close_frame(
+        &peer.session.local.agent_id,
+        &peer.session.remote.agent_id,
+        stream_id,
+    );
     peer.send_frame(&close).await?;
-    let close_ack = rx
-        .recv()
-        .await
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "close ack receiver closed"))?;
-    if close_ack.header.stream_id != Some(stream_id) {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "unexpected stream_id on close ack",
-        ));
-    }
-    match close_ack.message {
-        Message::StreamClose(_) => {
-            registry.lock().await.mark_stream_closed(stream_id);
-            Ok(())
-        }
-        other => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected StreamClose ack, got {:?}", other),
-        )),
-    }
+    expect_stream_close_ack(&mut rx, stream_id).await?;
+    registry.lock().await.mark_stream_closed(stream_id);
+    Ok(())
 }

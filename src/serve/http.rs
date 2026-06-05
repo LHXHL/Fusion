@@ -98,23 +98,22 @@ pub fn parse_http_proxy_request(bytes: &[u8]) -> Result<HttpProxyRequest, Error>
         )
     })?;
 
-    let mut rewritten = format!("{} {} {}\r\n", method, origin_form_path(&absolute), version);
+    let mut rewritten =
+        format!("{} {} {}\r\n", method, origin_form_path(&absolute), version).into_bytes();
     for header in lines.take_while(|line| !line.is_empty()) {
-        rewritten.push_str(header);
-        rewritten.push_str("\r\n");
+        if is_hop_by_hop_header(header) {
+            continue;
+        }
+        rewritten.extend_from_slice(header.as_bytes());
+        rewritten.extend_from_slice(b"\r\n");
     }
-    rewritten.push_str("\r\n");
-    rewritten.extend(std::str::from_utf8(&bytes[header_end..]).map_err(|err| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("http proxy request body prefix is not valid utf-8: {err}"),
-        )
-    })?);
+    rewritten.extend_from_slice(b"\r\n");
+    rewritten.extend_from_slice(&bytes[header_end..]);
 
     Ok(HttpProxyRequest {
         target_host: target_host.to_string(),
         target_port,
-        initial_payload: rewritten.into_bytes(),
+        initial_payload: rewritten,
         connect_tunnel: false,
     })
 }
@@ -132,6 +131,24 @@ fn origin_form_path(url: &Url) -> String {
 }
 
 fn split_host_port(target: &str) -> Result<(String, u16), Error> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:").ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid CONNECT target `{target}`"),
+            )
+        })?;
+        return Ok((
+            host.to_string(),
+            port.parse::<u16>().map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid CONNECT target port in `{target}`: {err}"),
+                )
+            })?,
+        ));
+    }
+
     let (host, port) = target.rsplit_once(':').ok_or_else(|| {
         Error::new(
             ErrorKind::InvalidInput,
@@ -147,6 +164,15 @@ fn split_host_port(target: &str) -> Result<(String, u16), Error> {
             )
         })?,
     ))
+}
+
+fn is_hop_by_hop_header(header: &str) -> bool {
+    let name = header.split(':').next().unwrap_or("").trim();
+    name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 #[cfg(test)]
@@ -174,6 +200,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_connect_request_with_ipv6_target() {
+        let request = parse_http_proxy_request(
+            b"CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n",
+        )
+        .unwrap();
+        assert!(request.connect_tunnel);
+        assert_eq!(request.target_host, "::1");
+        assert_eq!(request.target_port, 8443);
+    }
+
+    #[test]
     fn rewrite_absolute_form_request() {
         let request = parse_http_proxy_request(
             b"GET http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n",
@@ -185,5 +222,25 @@ mod tests {
         assert!(std::str::from_utf8(&request.initial_payload)
             .unwrap()
             .starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn rewrite_absolute_form_request_with_binary_body_prefix() {
+        let request = parse_http_proxy_request(
+            b"POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\n\x00\x01\x02\x03",
+        )
+        .unwrap();
+        assert!(request.initial_payload.ends_with(&[0, 1, 2, 3]));
+    }
+
+    #[test]
+    fn rewrite_absolute_form_request_strips_hop_by_hop_headers() {
+        let request = parse_http_proxy_request(
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .unwrap();
+        let payload = String::from_utf8(request.initial_payload).unwrap();
+        assert!(!payload.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(!payload.to_ascii_lowercase().contains("connection:"));
     }
 }

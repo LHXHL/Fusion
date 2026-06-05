@@ -2,6 +2,8 @@ pub mod cli;
 pub mod config;
 pub mod runtime;
 pub mod runtime_bootstrap;
+pub mod runtime_bridge;
+pub mod runtime_http;
 pub mod runtime_mode;
 pub mod runtime_orchestrator;
 pub mod runtime_peer;

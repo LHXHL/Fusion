@@ -5,3 +5,5 @@ pub mod tcp_mux;
 pub mod tls;
 pub mod ws;
 pub mod ws_mux;
+pub mod udp;
+pub mod udp_mux;

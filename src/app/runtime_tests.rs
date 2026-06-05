@@ -1,7 +1,9 @@
 use crate::{
     agent::identity::AgentIdentity,
     app::{
-        config::{AgentIdentityConfig, ServeEndpoint, StatusScope, TaskRequestConfig},
+        config::{AgentIdentityConfig, AppConfig, RetryPolicy, ServeEndpoint, StatusScope, TaskRequestConfig, TunnelEndpoint},
+        runtime_http::{handle_outbound_http_client, handle_outbound_http_ws_client},
+        runtime_orchestrator::{spawn_inbound_tasks, spawn_outbound_tasks, RuntimeShared},
         runtime_relay::{handle_tcp_relay_stream_open, handle_ws_relay_stream_open},
         runtime_socks5::{handle_outbound_socks5_client, handle_outbound_socks5_ws_client},
         runtime_status::{
@@ -33,6 +35,7 @@ use crate::{
 };
 use data_encoding::HEXLOWER;
 use std::sync::Arc;
+use tokio::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -842,4 +845,391 @@ async fn ws_socks5_over_relay_roundtrip() {
     client_task.await.unwrap();
     relay_task.await.unwrap();
     target_task.await.unwrap();
+}
+
+
+
+#[tokio::test]
+async fn tcp_http_proxy_over_relay_roundtrip() {
+    let http_listener = bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_server = tokio::spawn(async move {
+        let (mut stream, _) = http_listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 512];
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        buf
+    });
+
+    let target_listener = bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let relay_listener = bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+
+    let target_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("tcp-http-target".into()),
+        key: None,
+    });
+    let relay_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("tcp-http-relay".into()),
+        key: None,
+    });
+    let leaf_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("tcp-http-leaf".into()),
+        key: None,
+    });
+
+    let target_id = target_identity.id.clone();
+    let target_task = tokio::spawn(async move {
+        let peer = accept_mux_peer(target_identity, target_listener)
+            .await
+            .unwrap();
+        let (stream_id, open) = peer.read_stream_open().await.unwrap();
+        let rx = peer.open_stream_receiver(stream_id).await;
+        proxy_mux_stream_loop(
+            peer,
+            &RawService {
+                host: None,
+                port: None,
+            },
+            open,
+            stream_id,
+            rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    let relay_task = tokio::spawn(async move {
+        let downstream_peer = accept_mux_peer(relay_identity, relay_listener)
+            .await
+            .unwrap();
+        let upstream_peer = connect_mux_peer(
+            AgentIdentity::from_config(&AgentIdentityConfig {
+                name: Some("tcp-http-upstream".into()),
+                key: None,
+            }),
+            &target_addr.to_string(),
+        )
+        .await
+        .unwrap();
+        let mut peer_map = std::collections::HashMap::new();
+        peer_map.insert(
+            upstream_peer.session.remote.agent_id.clone(),
+            upstream_peer.clone(),
+        );
+        let peer_map = Arc::new(Mutex::new(peer_map));
+        let allocator = Arc::new(Mutex::new(5000_u32));
+        let open_frame = downstream_peer.read_stream_open_frame().await.unwrap();
+        let relay_links = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        handle_tcp_relay_stream_open(
+            peer_map,
+            allocator,
+            relay_links,
+            downstream_peer,
+            open_frame,
+        )
+        .await
+        .unwrap();
+    });
+
+    let leaf_peer = connect_mux_peer(leaf_identity, &relay_addr.to_string())
+        .await
+        .unwrap();
+    let (mut local_client, local_server) = tcp_socket_pair().await;
+    let remote_def = dynamic_raw_service_definition();
+    let registry = Arc::new(Mutex::new(crate::agent::registry::AgentRegistry::new()));
+
+    let client_task = tokio::spawn(async move {
+        local_client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/hello?x=1 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    http_addr.port(),
+                    http_addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 128];
+        let n = local_client.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with("\r\n\r\nok"));
+    });
+
+    let handler_task = tokio::spawn(handle_outbound_http_client(
+        leaf_peer,
+        remote_def,
+        Some(target_id),
+        local_server,
+        1,
+        registry,
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("tcp http proxy client timed out")
+        .unwrap();
+    let req = String::from_utf8(
+        tokio::time::timeout(Duration::from_secs(5), http_server)
+            .await
+            .expect("tcp http upstream server timed out")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(req.starts_with("GET /hello?x=1 HTTP/1.1\r\n"));
+    assert!(req.contains("Host: 127.0.0.1:"));
+
+    handler_task.abort();
+    relay_task.abort();
+    target_task.abort();
+}
+
+#[tokio::test]
+async fn ws_http_connect_over_relay_roundtrip() {
+    let echo_listener = bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = echo_listener.accept().await.unwrap();
+        let mut buf = [0_u8; 256];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await.unwrap();
+        }
+    });
+
+    let target_listener = bind_ws("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    let relay_listener = bind_ws("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+
+    let target_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("ws-http-target".into()),
+        key: None,
+    });
+    let relay_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("ws-http-relay".into()),
+        key: None,
+    });
+    let leaf_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+        name: Some("ws-http-leaf".into()),
+        key: None,
+    });
+
+    let target_id = target_identity.id.clone();
+    let target_task = tokio::spawn(async move {
+        let peer = accept_ws_mux_peer(target_identity, target_listener, None)
+            .await
+            .unwrap();
+        let (stream_id, open) = peer.read_stream_open().await.unwrap();
+        let rx = peer.open_stream_receiver(stream_id).await;
+        proxy_ws_mux_stream_loop(
+            peer,
+            &RawService {
+                host: None,
+                port: None,
+            },
+            open,
+            stream_id,
+            rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    let relay_task = tokio::spawn(async move {
+        let downstream_peer = accept_ws_mux_peer(relay_identity, relay_listener, None)
+            .await
+            .unwrap();
+        let upstream_peer = connect_ws_mux_peer(
+            AgentIdentity::from_config(&AgentIdentityConfig {
+                name: Some("ws-http-upstream".into()),
+                key: None,
+            }),
+            &format!("ws://{}/tunnel", target_addr),
+        )
+        .await
+        .unwrap();
+        let mut peer_map = std::collections::HashMap::new();
+        peer_map.insert(
+            upstream_peer.session.remote.agent_id.clone(),
+            upstream_peer.clone(),
+        );
+        let peer_map = Arc::new(Mutex::new(peer_map));
+        let allocator = Arc::new(Mutex::new(6000_u32));
+        let open_frame = downstream_peer.read_stream_open_frame().await.unwrap();
+        let relay_links = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        handle_ws_relay_stream_open(
+            peer_map,
+            allocator,
+            relay_links,
+            downstream_peer,
+            open_frame,
+        )
+        .await
+        .unwrap();
+    });
+
+    let leaf_peer = connect_ws_mux_peer(leaf_identity, &format!("ws://{}/tunnel", relay_addr))
+        .await
+        .unwrap();
+    let (mut local_client, local_server) = tcp_socket_pair().await;
+    let remote_def = dynamic_raw_service_definition();
+    let registry = Arc::new(Mutex::new(crate::agent::registry::AgentRegistry::new()));
+
+    let client_task = tokio::spawn(async move {
+        local_client
+            .write_all(
+                format!(
+                    "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    echo_addr.port(),
+                    echo_addr.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let mut established = [0_u8; 128];
+        let n = local_client.read(&mut established).await.unwrap();
+        let response = String::from_utf8_lossy(&established[..n]);
+        assert!(response.starts_with("HTTP/1.1 200 Connection Established\r\n\r\n"));
+
+        local_client.write_all(b"ws-http-connect-ok").await.unwrap();
+        let mut buf = [0_u8; 64];
+        let n = local_client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ws-http-connect-ok");
+    });
+
+    let handler_task = tokio::spawn(handle_outbound_http_ws_client(
+        leaf_peer,
+        remote_def,
+        Some(target_id),
+        local_server,
+        1,
+        registry,
+    ));
+
+    tokio::time::timeout(Duration::from_secs(5), client_task)
+        .await
+        .expect("ws http proxy client timed out")
+        .unwrap();
+    handler_task.abort();
+    relay_task.abort();
+    target_task.abort();
+}
+
+
+#[tokio::test]
+async fn udp_inbound_runtime_registers_direct_session() {
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "fusion-udp-runtime-test-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let shared = RuntimeShared::new(Vec::new(), &data_dir).await;
+
+    let listener_config = AppConfig {
+        listens: vec![TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("udp://127.0.0.1:{port}")).unwrap(),
+        }],
+        connects: vec![],
+        local_serves: vec![],
+        remote_serves: vec![],
+        remote_peer_id: None,
+        identity: AgentIdentityConfig {
+            name: Some("udp-runtime-listener".into()),
+            key: None,
+        },
+        retry: RetryPolicy::default(),
+        task_request: None,
+        status_command: None,
+        control_command: None,
+        config_file: None,
+        data_dir: data_dir.clone(),
+        log_level: "info".into(),
+    };
+    let listener_identity = AgentIdentity::from_config(&listener_config.identity);
+    let inbound_tasks = spawn_inbound_tasks(
+        &listener_config,
+        &listener_identity,
+        &shared,
+        None,
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(inbound_tasks.len(), 1);
+
+    let outbound_config = AppConfig {
+        listens: vec![],
+        connects: vec![TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("udp://127.0.0.1:{port}")).unwrap(),
+        }],
+        local_serves: vec![],
+        remote_serves: vec![],
+        remote_peer_id: None,
+        identity: AgentIdentityConfig {
+            name: Some("udp-runtime-dialer".into()),
+            key: None,
+        },
+        retry: RetryPolicy {
+            max_retries: Some(1),
+            interval_secs: 1,
+            max_interval_secs: 1,
+        },
+        task_request: None,
+        status_command: None,
+        control_command: None,
+        config_file: None,
+        data_dir: data_dir.clone(),
+        log_level: "info".into(),
+    };
+    let dialer_identity = AgentIdentity::from_config(&outbound_config.identity);
+    let outbound_tasks = spawn_outbound_tasks(
+        &outbound_config,
+        &dialer_identity,
+        &shared,
+        None,
+        None,
+        None,
+        &[],
+    );
+    assert_eq!(outbound_tasks.len(), 1);
+
+    for task in outbound_tasks {
+        task.await.unwrap();
+    }
+    for task in inbound_tasks {
+        task.await.unwrap();
+    }
+
+    let sessions = shared.hub.lock().await.sessions_snapshot();
+    let peers = shared.registry.lock().await.peers_snapshot();
+    assert!(!sessions.is_empty());
+    assert!(!peers.is_empty());
+    assert!(sessions.iter().any(|s| s.remote.agent_name == "udp-runtime-dialer"));
+    assert!(peers.iter().any(|p| p.session.remote.agent_name == "udp-runtime-dialer"));
 }

@@ -7,6 +7,7 @@ use crate::{
     agent::{identity::AgentIdentity, registry::AgentRegistry},
     app::{
         config::{AppConfig, TunnelEndpoint},
+        runtime_http::{run_outbound_http_once, run_outbound_http_ws_once},
         runtime_mode::{
             collect_remote_port_forward_services, decide_inbound_runtime_mode,
             decide_outbound_runtime_mode, InboundRuntimeMode, OutboundRuntimeMode,
@@ -27,8 +28,8 @@ use crate::{
     session::{hub::SessionHub, reconnect::ReconnectState},
     tunnel::{
         dialer::{classify_endpoint, DialTarget},
-        listener::bind_endpoint,
-        tcp, ws,
+        listener::{bind_endpoint, BoundListenerHandle},
+        tcp, udp, ws,
     },
 };
 
@@ -127,6 +128,10 @@ pub async fn spawn_inbound_tasks(
             local_services_present,
         ) {
             InboundRuntimeMode::RawTcp => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected tcp listener handle");
+                    continue;
+                };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
@@ -135,7 +140,7 @@ pub async fn spawn_inbound_tasks(
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_once(
                         listener_identity,
-                        bound.listener,
+                        listener,
                         raw_service,
                         shared.hub,
                         shared.registry,
@@ -147,6 +152,10 @@ pub async fn spawn_inbound_tasks(
                 }));
             }
             InboundRuntimeMode::TaskTcp => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected tcp listener handle");
+                    continue;
+                };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
@@ -155,7 +164,7 @@ pub async fn spawn_inbound_tasks(
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_tcp(
                         listener_identity,
-                        bound.listener,
+                        listener,
                         listener_services,
                         shared.hub,
                         shared.registry,
@@ -170,6 +179,10 @@ pub async fn spawn_inbound_tasks(
                 }));
             }
             InboundRuntimeMode::RawWs => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected ws listener handle");
+                    continue;
+                };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
@@ -178,7 +191,7 @@ pub async fn spawn_inbound_tasks(
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_ws_once(
                         listener_identity,
-                        bound.listener,
+                        listener,
                         bound.ws_tls_acceptor,
                         raw_service,
                         shared.hub,
@@ -191,6 +204,10 @@ pub async fn spawn_inbound_tasks(
                 }));
             }
             InboundRuntimeMode::TaskWs => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected ws listener handle");
+                    continue;
+                };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
@@ -199,7 +216,7 @@ pub async fn spawn_inbound_tasks(
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_ws(
                         listener_identity,
-                        bound.listener,
+                        listener,
                         bound.ws_tls_acceptor,
                         listener_services,
                         shared.hub,
@@ -214,6 +231,25 @@ pub async fn spawn_inbound_tasks(
                     }
                 }));
             }
+            InboundRuntimeMode::DirectUdp => {
+                let BoundListenerHandle::Udp(socket) = bound.handle else {
+                    eprintln!("session.inbound.error=expected udp listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    match udp::run_inbound_session_once(listener_identity, socket).await {
+                        Ok((session, _, _)) => {
+                            shared.hub.lock().await.upsert(session.clone());
+                            shared.registry.lock().await.upsert_peer(session);
+                        }
+                        Err(err) => eprintln!("session.inbound.error={err}"),
+                    }
+                }));
+            }
         }
     }
     tasks
@@ -224,6 +260,7 @@ pub fn spawn_outbound_tasks(
     identity: &AgentIdentity,
     shared: &RuntimeShared,
     outbound_socks5_service: Option<crate::serve::service::ServiceDefinition>,
+    outbound_http_proxy_service: Option<crate::serve::service::ServiceDefinition>,
     outbound_egress_service: Option<crate::serve::service::ServiceDefinition>,
     exposed_service_labels: &[String],
 ) -> Vec<JoinHandle<()>> {
@@ -236,6 +273,7 @@ pub fn spawn_outbound_tasks(
         let task_request = config.task_request.clone();
         let data_dir = config.data_dir.clone();
         let local_socks = outbound_socks5_service.clone();
+        let local_http_proxy = outbound_http_proxy_service.clone();
         let remote_egress = outbound_egress_service.clone();
         let exposed_service_labels = exposed_service_labels.to_vec();
         let has_listener = !config.listens.is_empty();
@@ -247,6 +285,7 @@ pub fn spawn_outbound_tasks(
                     &connect_endpoint,
                     task_request.as_ref(),
                     local_socks.is_some(),
+                    local_http_proxy.is_some(),
                     remote_egress.is_some(),
                     has_listener,
                 ) {
@@ -279,6 +318,30 @@ pub fn spawn_outbound_tasks(
                             connect_identity.clone(),
                             &connect_endpoint,
                             local_socks.clone().unwrap(),
+                            remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::HttpProxyTcp => {
+                        run_outbound_http_once(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            local_http_proxy.clone().unwrap(),
+                            remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::HttpProxyWs => {
+                        run_outbound_http_ws_once(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            local_http_proxy.clone().unwrap(),
                             remote_egress.clone().unwrap(),
                             remote_peer_id.clone(),
                             shared.hub.clone(),
@@ -384,6 +447,16 @@ async fn run_outbound_once(
             );
             Ok(())
         }
+        DialTarget::Udp { addr } => {
+            let (session, _) = udp::run_outbound_session_once(identity, &addr).await?;
+            hub.lock().await.upsert(session.clone());
+            registry.lock().await.upsert_peer(session.clone());
+            println!(
+                "session.outbound.peer={} to={} via=udp",
+                session.remote.agent_id, addr
+            );
+            Ok(())
+        }
     }
 }
 
@@ -391,6 +464,7 @@ pub fn find_runtime_services(
     local_services: &[crate::serve::service::ServiceDefinition],
     remote_services: &[crate::serve::service::ServiceDefinition],
 ) -> (
+    Option<crate::serve::service::ServiceDefinition>,
     Option<crate::serve::service::ServiceDefinition>,
     Option<crate::serve::service::ServiceDefinition>,
     Option<crate::serve::service::ServiceDefinition>,
@@ -403,6 +477,10 @@ pub fn find_runtime_services(
     let outbound_socks5_service = local_services
         .iter()
         .find(|svc| matches!(svc.kind, ServiceKind::LocalSocks5(_)))
+        .cloned();
+    let outbound_http_proxy_service = local_services
+        .iter()
+        .find(|svc| matches!(svc.kind, ServiceKind::LocalHttpProxy(_)))
         .cloned();
     let outbound_egress_service = remote_services
         .iter()
@@ -418,6 +496,7 @@ pub fn find_runtime_services(
     (
         inbound_raw_service,
         outbound_socks5_service,
+        outbound_http_proxy_service,
         outbound_egress_service,
         remote_port_forward_services,
     )

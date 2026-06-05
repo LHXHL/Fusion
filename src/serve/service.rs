@@ -6,6 +6,7 @@ use crate::{
     app::config::ServeEndpoint,
     protocol::message::StreamOpenMessage,
     serve::{
+        http::{HttpProxyRequest, HttpProxyService},
         portfwd::PortForwardService,
         raw::RawService,
         socks5::{Socks5ConnectRequest, Socks5Service},
@@ -15,6 +16,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceKind {
     LocalSocks5(Socks5Service),
+    LocalHttpProxy(HttpProxyService),
     RemoteRaw(RawService),
     RemotePortForward(PortForwardService),
     Unsupported { scheme: String, original: String },
@@ -30,6 +32,7 @@ impl ServiceDefinition {
     pub fn from_local_endpoint(endpoint: &ServeEndpoint) -> Result<Self, Error> {
         let kind = match endpoint.url.scheme.as_str() {
             "socks5" => ServiceKind::LocalSocks5(Socks5Service::from_url(&endpoint.url)?),
+            "http" => ServiceKind::LocalHttpProxy(HttpProxyService::from_url(&endpoint.url)?),
             other => ServiceKind::Unsupported {
                 scheme: other.to_string(),
                 original: endpoint.url.original.clone(),
@@ -61,6 +64,7 @@ impl ServiceDefinition {
     pub fn summary_line(&self) -> String {
         match &self.kind {
             ServiceKind::LocalSocks5(svc) => format!("service.local=socks5://{}", svc.bind_label()),
+            ServiceKind::LocalHttpProxy(svc) => format!("service.local=http://{}", svc.bind_label()),
             ServiceKind::RemoteRaw(svc) => format!("service.remote=raw://{}", svc.target_label()),
             ServiceKind::RemotePortForward(svc) => {
                 format!("service.remote=port://{}", svc.summary_label())
@@ -93,9 +97,12 @@ pub fn validate_service_pairing(
     local: &[ServiceDefinition],
     remote: &[ServiceDefinition],
 ) -> Result<(), Error> {
-    let has_local_socks5 = local
-        .iter()
-        .any(|s| matches!(s.kind, ServiceKind::LocalSocks5(_)));
+    let has_local_stream_proxy = local.iter().any(|s| {
+        matches!(
+            s.kind,
+            ServiceKind::LocalSocks5(_) | ServiceKind::LocalHttpProxy(_)
+        )
+    });
     let has_supported_remote_egress = remote.iter().any(|s| {
         matches!(
             s.kind,
@@ -103,10 +110,10 @@ pub fn validate_service_pairing(
         )
     });
 
-    if has_local_socks5 && !has_supported_remote_egress {
+    if has_local_stream_proxy && !has_supported_remote_egress {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "local socks5 service currently requires at least one remote raw/port service",
+            "local socks5/http service currently requires at least one remote raw/port service",
         ));
     }
 
@@ -134,9 +141,9 @@ pub fn build_remote_stream_open(
                 scheme, original
             ),
         )),
-        ServiceKind::LocalSocks5(_) => Err(Error::new(
+        ServiceKind::LocalSocks5(_) | ServiceKind::LocalHttpProxy(_) => Err(Error::new(
             ErrorKind::InvalidInput,
-            "cannot build remote stream open from local socks5 service",
+            "cannot build remote stream open from local proxy service",
         )),
     }
 }
@@ -145,9 +152,28 @@ pub fn build_remote_stream_open_for_request(
     definition: &ServiceDefinition,
     request: &Socks5ConnectRequest,
 ) -> Result<StreamOpenMessage, Error> {
+    build_remote_stream_open_for_target(
+        definition,
+        &request.target_host(),
+        request.port,
+    )
+}
+
+pub fn build_remote_stream_open_for_http_request(
+    definition: &ServiceDefinition,
+    request: &HttpProxyRequest,
+) -> Result<StreamOpenMessage, Error> {
+    build_remote_stream_open_for_target(definition, &request.target_host, request.target_port)
+}
+
+fn build_remote_stream_open_for_target(
+    definition: &ServiceDefinition,
+    target_host: &str,
+    target_port: u16,
+) -> Result<StreamOpenMessage, Error> {
     match &definition.kind {
         ServiceKind::RemoteRaw(svc) => {
-            let target = svc.resolve_target(Some(&request.target_host()), Some(request.port))?;
+            let target = svc.resolve_target(Some(target_host), Some(target_port))?;
             Ok(StreamOpenMessage {
                 service: "raw".to_string(),
                 target_host: Some(target.host),
@@ -166,9 +192,9 @@ pub fn build_remote_stream_open_for_request(
                 scheme, original
             ),
         )),
-        ServiceKind::LocalSocks5(_) => Err(Error::new(
+        ServiceKind::LocalSocks5(_) | ServiceKind::LocalHttpProxy(_) => Err(Error::new(
             ErrorKind::InvalidInput,
-            "cannot build remote stream open from local socks5 service",
+            "cannot build remote stream open from local proxy service",
         )),
     }
 }
@@ -178,10 +204,12 @@ mod tests {
     use crate::{
         app::config::ServeEndpoint,
         serve::{
+            http::HttpProxyRequest,
             portfwd::PortForwardService,
             service::{
                 build_local_services, build_remote_services, build_remote_stream_open,
-                build_remote_stream_open_for_request, validate_service_pairing, ServiceKind,
+                build_remote_stream_open_for_http_request, build_remote_stream_open_for_request,
+                validate_service_pairing, ServiceKind,
             },
             socks5::{Socks5Address, Socks5ConnectRequest},
         },
@@ -203,6 +231,16 @@ mod tests {
         assert!(matches!(local_defs[0].kind, ServiceKind::LocalSocks5(_)));
         assert!(matches!(remote_defs[0].kind, ServiceKind::RemoteRaw(_)));
         validate_service_pairing(&local_defs, &remote_defs).unwrap();
+    }
+
+    #[test]
+    fn build_http_proxy_service_definition() {
+        let local = vec![ServeEndpoint {
+            url: ParsedUrl::parse("http://127.0.0.1:8080").unwrap(),
+        }];
+        let local_defs = build_local_services(&local).unwrap();
+        assert!(matches!(local_defs[0].kind, ServiceKind::LocalHttpProxy(_)));
+        assert_eq!(local_defs[0].summary_line(), "service.local=http://127.0.0.1:8080");
     }
 
     #[test]
@@ -230,6 +268,25 @@ mod tests {
         let open = build_remote_stream_open_for_request(&remote_defs[0], &req).unwrap();
         assert_eq!(open.target_host.as_deref(), Some("dynamic.example"));
         assert_eq!(open.target_port, Some(8080));
+    }
+
+    #[test]
+    fn build_stream_open_from_http_request_for_dynamic_raw() {
+        let remote = vec![ServeEndpoint {
+            url: ParsedUrl::parse("raw://").unwrap(),
+        }];
+        let remote_defs = build_remote_services(&remote).unwrap();
+        let req = HttpProxyRequest {
+            target_host: "dynamic.example".to_string(),
+            target_port: 8081,
+            initial_payload: b"GET / HTTP/1.1
+
+".to_vec(),
+            connect_tunnel: false,
+        };
+        let open = build_remote_stream_open_for_http_request(&remote_defs[0], &req).unwrap();
+        assert_eq!(open.target_host.as_deref(), Some("dynamic.example"));
+        assert_eq!(open.target_port, Some(8081));
     }
 
     #[test]
