@@ -33,6 +33,13 @@ impl SessionHub {
         self.sessions.contains_key(peer_id)
     }
 
+    pub fn is_active(&self, peer_id: &str) -> bool {
+        self.sessions
+            .get(peer_id)
+            .map(|session| matches!(session.state, SessionState::Active))
+            .unwrap_or(false)
+    }
+
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![format!("session.count={}", self.sessions.len())];
         for session in self.sessions.values() {
@@ -79,5 +86,6 @@ mod tests {
 
         assert_eq!(hub.count(), 1);
         assert!(hub.contains("peer-1"));
+        assert!(hub.is_active("peer-1"));
     }
 }

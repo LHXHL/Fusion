@@ -157,6 +157,13 @@ impl AgentRegistry {
         peers
     }
 
+    pub fn is_peer_active(&self, peer_id: &str) -> bool {
+        self.peers
+            .get(peer_id)
+            .map(|peer| matches!(peer.session.state, SessionState::Active))
+            .unwrap_or(false)
+    }
+
     pub fn streams_snapshot(&self) -> Vec<RegisteredStream> {
         let mut streams: Vec<_> = self.streams.values().cloned().collect();
         streams.sort_by_key(|stream| stream.stream_id);
@@ -382,6 +389,7 @@ mod tests {
             registry.clone().peers.get("peer-1").unwrap().session.state,
             SessionState::Closed
         ));
+        assert!(!registry.is_peer_active("peer-1"));
     }
 
     #[test]

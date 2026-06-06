@@ -5,7 +5,10 @@ use std::{
     sync::Arc,
 };
 
-use tokio::{net::UdpSocket, sync::{mpsc, Mutex}};
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, Mutex},
+};
 
 use crate::{
     agent::identity::AgentIdentity,
@@ -47,10 +50,7 @@ impl MuxUdpPeer {
         }
         let written = self.socket.send(&payload).await?;
         if written != payload.len() {
-            return Err(Error::new(
-                ErrorKind::WriteZero,
-                "short udp datagram write",
-            ));
+            return Err(Error::new(ErrorKind::WriteZero, "short udp datagram write"));
         }
         Ok(())
     }
@@ -104,7 +104,10 @@ impl MuxUdpPeer {
     }
 }
 
-async fn read_boxed_frame(socket: &UdpSocket, shared_key: Option<&SharedKey>) -> Result<Frame, Error> {
+async fn read_boxed_frame(
+    socket: &UdpSocket,
+    shared_key: Option<&SharedKey>,
+) -> Result<Frame, Error> {
     let mut buf = vec![0_u8; 65_535];
     let n = socket.recv(&mut buf).await?;
     decode_transport_frame(&buf[..n], shared_key)
@@ -204,7 +207,10 @@ pub async fn accept_mux_peer(
     })
 }
 
-pub async fn connect_mux_peer(identity: AgentIdentity, endpoint: &str) -> Result<MuxUdpPeer, Error> {
+pub async fn connect_mux_peer(
+    identity: AgentIdentity,
+    endpoint: &str,
+) -> Result<MuxUdpPeer, Error> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(endpoint).await?;
     let peer_addr = socket.peer_addr()?;
@@ -318,7 +324,9 @@ mod tests {
             }
         });
 
-        let peer = connect_mux_peer(client_identity, &addr.to_string()).await.unwrap();
+        let peer = connect_mux_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
         peer.send_frame(
             &Frame::new(
                 MessageType::StreamData,
@@ -370,7 +378,9 @@ mod tests {
             }
         });
 
-        let peer = connect_mux_peer(client_identity, &addr.to_string()).await.unwrap();
+        let peer = connect_mux_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
         peer.send_frame(
             &Frame::new(
                 MessageType::StreamData,
@@ -409,7 +419,9 @@ mod tests {
             }
         });
 
-        let peer = connect_mux_peer(client_identity, &addr.to_string()).await.unwrap();
+        let peer = connect_mux_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
         peer.send_frame(&Frame::new(
             MessageType::Heartbeat,
             Some(peer.session.local.agent_id.clone()),
@@ -445,7 +457,9 @@ mod tests {
             assert_eq!(open.target_port, Some(80));
         });
 
-        let peer = connect_mux_peer(client_identity, &addr.to_string()).await.unwrap();
+        let peer = connect_mux_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
         peer.send_frame(
             &Frame::new(
                 MessageType::StreamOpen,

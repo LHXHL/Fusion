@@ -30,7 +30,86 @@ cargo run --bin fusion -- \
   -a node-b
 ```
 
-## 5. 查看状态
+## 5. HTTP Proxy 动态出口
+
+出口节点：
+
+```bash
+cargo run --bin fusion -- \
+  -s tcp://0.0.0.0:34996 \
+  -r raw:// \
+  -a exit-node
+```
+
+入口节点：
+
+```bash
+cargo run --bin fusion -- \
+  -c tcp://127.0.0.1:34996 \
+  -l http://127.0.0.1:8080 \
+  -r raw:// \
+  -a entry-node
+```
+
+## 6. UDP 直连
+
+监听端：
+
+```bash
+cargo run --bin fusion -- \
+  -s udp://0.0.0.0:39040 \
+  -a udp-a
+```
+
+连接端：
+
+```bash
+cargo run --bin fusion -- \
+  -c udp://127.0.0.1:39040 \
+  -a udp-b
+```
+
+## 7. Unix Socket 直连
+
+监听端：
+
+```bash
+cargo run --bin fusion -- \
+  -s unix:///tmp/fusion.sock \
+  -a unix-a
+```
+
+连接端：
+
+```bash
+cargo run --bin fusion -- \
+  -c unix:///tmp/fusion.sock \
+  -a unix-b
+```
+
+## 8. Memory transport
+
+`memory://NAME` 当前用于：
+- 同进程测试
+- 嵌入式/库模式
+
+不建议把它当作两个独立 CLI 进程之间的 transport。
+
+## 9. icmp / wg（sandbox datagram transport）
+
+```bash
+cargo run --bin fusion -- -s icmp://127.0.0.1:39050 -a icmp-a
+cargo run --bin fusion -- -c icmp://127.0.0.1:39050 -a icmp-b
+
+cargo run --bin fusion -- -s wg://127.0.0.1:39060 -a wg-a
+cargo run --bin fusion -- -c wg://127.0.0.1:39060 -a wg-b
+```
+
+说明：
+- 当前为 sandbox 兼容 datagram transport
+- 不等同于真实内核 ICMP / WireGuard 协议栈
+
+## 10. 查看状态
 
 ```bash
 cargo run --bin fusion -- status
@@ -39,7 +118,37 @@ cargo run --bin fusion -- routes list
 cargo run --bin fusion -- services list
 ```
 
-## 6. 使用配置文件
+## 11. 构建库与 C ABI
+
+```bash
+cargo build --lib
+```
+
+产物默认包含：
+- `rlib`
+- `cdylib`
+- `staticlib`
+
+头文件：
+- `/Users/qi4l/lang/Rust/Fusion-master/include/fusion.h`
+
+## 12. Phase 5 第一版：代理链与连接池
+
+```bash
+cargo run --bin fusion -- \
+  --up-connect tcp://127.0.0.1:34996 \
+  --down-connect ws://127.0.0.1:38080/tunnel \
+  --conn-policy round-robin \
+  -x socks5://127.0.0.1:1080 \
+  -f http://127.0.0.1:8080
+```
+
+说明：
+- `-f` 会作为代理链第一跳
+- `-x` 可追加后续跳点
+- 当前 `conn-policy` 主要作用于多上游 endpoint 的 task / direct 路径
+
+## 13. 使用配置文件
 
 ```bash
 cp fusion.toml.example fusion.toml
@@ -50,3 +159,18 @@ cargo run --bin fusion -- --config ./fusion.toml
 - 命令行参数优先
 - `fusion.toml` 只做默认值来源
 - 状态快照写到 `data-dir`
+
+## 14. Wrapper Pipeline 基础配置
+
+```bash
+cargo run --bin fusion -- \
+  -s tcp://127.0.0.1:34996 \
+  -k fusion-secret \
+  --wrap-compress \
+  --wrap-padding 32
+```
+
+说明：
+- `--wrap-compress`：启用 transport payload 压缩
+- `--wrap-padding <BYTES>`：增加固定额外 padding
+- 当前要求通信双方配置一致

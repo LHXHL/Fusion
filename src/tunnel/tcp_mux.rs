@@ -25,7 +25,10 @@ use crate::{
         heartbeat::heartbeat_frame,
         peer::{PeerInfo, PeerSession, SessionState},
     },
-    tunnel::tcp::{read_frame_with_key, write_frame_with_key},
+    tunnel::{
+        proxy::connect_via_proxy_chain,
+        tcp::{read_frame_with_key, write_frame_with_key},
+    },
 };
 
 #[derive(Debug, Default)]
@@ -226,7 +229,31 @@ pub async fn connect_mux_peer(
     identity: AgentIdentity,
     endpoint: &str,
 ) -> Result<MuxTcpPeer, Error> {
-    let mut stream = TcpStream::connect(endpoint).await?;
+    connect_mux_peer_via_proxy_chain(identity, endpoint, &[]).await
+}
+
+pub async fn connect_mux_peer_via_proxy_chain(
+    identity: AgentIdentity,
+    endpoint: &str,
+    proxy_chain: &[String],
+) -> Result<MuxTcpPeer, Error> {
+    let mut stream = if proxy_chain.is_empty() {
+        TcpStream::connect(endpoint).await?
+    } else {
+        let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid tcp endpoint `{endpoint}`"),
+            )
+        })?;
+        let port = port.parse::<u16>().map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid tcp endpoint port in `{endpoint}`: {err}"),
+            )
+        })?;
+        connect_via_proxy_chain(host, port, proxy_chain).await?
+    };
     let peer_addr = stream.peer_addr()?;
     let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
 

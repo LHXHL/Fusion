@@ -14,6 +14,11 @@ pub enum InboundRuntimeMode {
     RawWs,
     TaskWs,
     DirectUdp,
+    DirectSimplexHttp,
+    DirectIcmp,
+    DirectWg,
+    DirectUnix,
+    DirectMemory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +28,8 @@ pub enum OutboundRuntimeMode {
     Socks5Ws,
     HttpProxyTcp,
     HttpProxyWs,
+    ShadowsocksTcp,
+    ShadowsocksWs,
     RelayTcp,
     RelayWs,
     Direct,
@@ -51,6 +58,11 @@ pub fn decide_inbound_runtime_mode(
         (ListenerTransport::Ws, true, false) => InboundRuntimeMode::RawWs,
         (ListenerTransport::Ws, _, _) => InboundRuntimeMode::TaskWs,
         (ListenerTransport::Udp, _, _) => InboundRuntimeMode::DirectUdp,
+        (ListenerTransport::SimplexHttp, _, _) => InboundRuntimeMode::DirectSimplexHttp,
+        (ListenerTransport::Icmp, _, _) => InboundRuntimeMode::DirectIcmp,
+        (ListenerTransport::Wg, _, _) => InboundRuntimeMode::DirectWg,
+        (ListenerTransport::Unix, _, _) => InboundRuntimeMode::DirectUnix,
+        (ListenerTransport::Memory, _, _) => InboundRuntimeMode::DirectMemory,
     }
 }
 
@@ -59,6 +71,7 @@ pub fn decide_outbound_runtime_mode(
     task_request: Option<&TaskRequestConfig>,
     has_local_socks: bool,
     has_local_http_proxy: bool,
+    has_local_shadowsocks: bool,
     has_remote_egress: bool,
     has_listener: bool,
 ) -> OutboundRuntimeMode {
@@ -80,6 +93,12 @@ pub fn decide_outbound_runtime_mode(
     }
     if is_ws && has_local_http_proxy && has_remote_egress {
         return OutboundRuntimeMode::HttpProxyWs;
+    }
+    if is_tcp && has_local_shadowsocks && has_remote_egress {
+        return OutboundRuntimeMode::ShadowsocksTcp;
+    }
+    if is_ws && has_local_shadowsocks && has_remote_egress {
+        return OutboundRuntimeMode::ShadowsocksWs;
     }
     if is_tcp && has_listener {
         return OutboundRuntimeMode::RelayTcp;
@@ -122,8 +141,36 @@ mod tests {
             InboundRuntimeMode::TaskWs
         );
         assert_eq!(
-            decide_inbound_runtime_mode(crate::tunnel::listener::ListenerTransport::Udp, false, false),
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::Udp,
+                false,
+                false
+            ),
             InboundRuntimeMode::DirectUdp
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexHttp,
+                false,
+                false
+            ),
+            InboundRuntimeMode::DirectSimplexHttp
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::Icmp,
+                false,
+                false
+            ),
+            InboundRuntimeMode::DirectIcmp
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::Wg,
+                false,
+                false
+            ),
+            InboundRuntimeMode::DirectWg
         );
     }
 
@@ -138,6 +185,9 @@ mod tests {
         let udp = TunnelEndpoint {
             url: ParsedUrl::parse("udp://127.0.0.1:3").unwrap(),
         };
+        let memory = TunnelEndpoint {
+            url: ParsedUrl::parse("memory://mesh-a").unwrap(),
+        };
         assert_eq!(
             decide_outbound_runtime_mode(
                 &tcp,
@@ -151,32 +201,45 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 false
             ),
             OutboundRuntimeMode::Task
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, true, false, true, false),
+            decide_outbound_runtime_mode(&tcp, None, true, false, false, true, false),
             OutboundRuntimeMode::Socks5Tcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, true, false, true, false),
+            decide_outbound_runtime_mode(&ws, None, true, false, false, true, false),
             OutboundRuntimeMode::Socks5Ws
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, true, true, false),
+            decide_outbound_runtime_mode(&tcp, None, false, true, false, true, false),
             OutboundRuntimeMode::HttpProxyTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, false, true, true, false),
+            decide_outbound_runtime_mode(&ws, None, false, true, false, true, false),
             OutboundRuntimeMode::HttpProxyWs
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, false, false, true),
+            decide_outbound_runtime_mode(&tcp, None, false, false, true, true, false),
+            OutboundRuntimeMode::ShadowsocksTcp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&ws, None, false, false, true, true, false),
+            OutboundRuntimeMode::ShadowsocksWs
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&tcp, None, false, false, false, false, true),
             OutboundRuntimeMode::RelayTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&udp, None, false, false, false, true),
+            decide_outbound_runtime_mode(&udp, None, false, false, false, false, true),
+            OutboundRuntimeMode::Direct
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&memory, None, false, false, false, false, false),
             OutboundRuntimeMode::Direct
         );
     }

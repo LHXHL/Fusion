@@ -140,6 +140,8 @@ mod tests {
                     url: ParsedUrl::parse(url).unwrap(),
                 })
                 .collect(),
+            up_connects: vec![],
+            down_connects: vec![],
             local_serves: local_serves
                 .into_iter()
                 .map(|url| ServeEndpoint {
@@ -152,12 +154,16 @@ mod tests {
                     url: ParsedUrl::parse(url).unwrap(),
                 })
                 .collect(),
+            proxy_chain: vec![],
+            front_proxy: None,
+            conn_policy: crate::app::config::ConnPolicy::Fallback,
             remote_peer_id: None,
             identity: AgentIdentityConfig {
                 name: Some("bootstrap-test".into()),
                 key: None,
             },
             retry: RetryPolicy::default(),
+            wrapper: crate::crypto::wrapper::WrapperConfig::default(),
             task_request: None,
             status_command: None,
             control_command: None,

@@ -201,10 +201,9 @@ mod tests {
 
     #[test]
     fn parse_connect_request_with_ipv6_target() {
-        let request = parse_http_proxy_request(
-            b"CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n",
-        )
-        .unwrap();
+        let request =
+            parse_http_proxy_request(b"CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n")
+                .unwrap();
         assert!(request.connect_tunnel);
         assert_eq!(request.target_host, "::1");
         assert_eq!(request.target_port, 8443);

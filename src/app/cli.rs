@@ -5,10 +5,11 @@ use clap::{parser::ValueSource, Args, CommandFactory, FromArgMatches, Parser, Su
 use data_encoding::HEXLOWER;
 
 use crate::app::config::{
-    load_file_config, AgentIdentityConfig, AppConfig, ControlCommandConfig, FileAppConfig,
-    RetryPolicy, ServeEndpoint, StatusCommandConfig, StatusScope, TaskRequestConfig,
+    load_file_config, AgentIdentityConfig, AppConfig, ConnPolicy, ControlCommandConfig,
+    FileAppConfig, RetryPolicy, ServeEndpoint, StatusCommandConfig, StatusScope, TaskRequestConfig,
     TunnelEndpoint,
 };
+use crate::crypto::wrapper::WrapperConfig;
 use crate::protocol::message::TaskAction;
 use crate::utils::url::ParsedUrl;
 
@@ -22,11 +23,31 @@ pub struct CliArgs {
     #[arg(short = 'c', long = "connect", value_name = "URL", global = true)]
     pub connects: Vec<String>,
 
+    #[arg(long = "up-connect", value_name = "URL", global = true)]
+    pub up_connects: Vec<String>,
+
+    #[arg(long = "down-connect", value_name = "URL", global = true)]
+    pub down_connects: Vec<String>,
+
     #[arg(short = 'l', long = "local-serve", value_name = "URL", global = true)]
     pub local_serves: Vec<String>,
 
     #[arg(short = 'r', long = "remote-serve", value_name = "URL", global = true)]
     pub remote_serves: Vec<String>,
+
+    #[arg(short = 'x', long = "proxy-chain", value_name = "URL", global = true)]
+    pub proxy_chain: Vec<String>,
+
+    #[arg(short = 'f', long = "front-proxy", value_name = "URL", global = true)]
+    pub front_proxy: Option<String>,
+
+    #[arg(
+        long = "conn-policy",
+        value_name = "POLICY",
+        default_value = "fallback",
+        global = true
+    )]
+    pub conn_policy: ConnPolicy,
 
     #[arg(long = "remote-peer", value_name = "AGENT_ID", global = true)]
     pub remote_peer: Option<String>,
@@ -36,6 +57,12 @@ pub struct CliArgs {
 
     #[arg(short = 'k', long = "key", value_name = "SECRET", global = true)]
     pub key: Option<String>,
+
+    #[arg(long = "wrap-compress", global = true)]
+    pub wrap_compress: bool,
+
+    #[arg(long = "wrap-padding", value_name = "BYTES", global = true)]
+    pub wrap_padding: Option<usize>,
 
     #[arg(long = "retry", value_name = "N", global = true)]
     pub retry: Option<u32>,
@@ -208,11 +235,18 @@ impl TryFrom<CliArgs> for AppConfig {
 struct CliValueSources {
     listens: bool,
     connects: bool,
+    up_connects: bool,
+    down_connects: bool,
     local_serves: bool,
     remote_serves: bool,
+    proxy_chain: bool,
+    front_proxy: bool,
+    conn_policy: bool,
     remote_peer: bool,
     agent_name: bool,
     key: bool,
+    wrap_compress: bool,
+    wrap_padding: bool,
     retry: bool,
     retry_interval: bool,
     retry_max_interval: bool,
@@ -226,11 +260,18 @@ impl CliValueSources {
         Self {
             listens: matches.value_source("listens") == Some(ValueSource::CommandLine),
             connects: matches.value_source("connects") == Some(ValueSource::CommandLine),
+            up_connects: matches.value_source("up_connects") == Some(ValueSource::CommandLine),
+            down_connects: matches.value_source("down_connects") == Some(ValueSource::CommandLine),
             local_serves: matches.value_source("local_serves") == Some(ValueSource::CommandLine),
             remote_serves: matches.value_source("remote_serves") == Some(ValueSource::CommandLine),
+            proxy_chain: matches.value_source("proxy_chain") == Some(ValueSource::CommandLine),
+            front_proxy: matches.value_source("front_proxy") == Some(ValueSource::CommandLine),
+            conn_policy: matches.value_source("conn_policy") == Some(ValueSource::CommandLine),
             remote_peer: matches.value_source("remote_peer") == Some(ValueSource::CommandLine),
             agent_name: matches.value_source("agent_name") == Some(ValueSource::CommandLine),
             key: matches.value_source("key") == Some(ValueSource::CommandLine),
+            wrap_compress: matches.value_source("wrap_compress") == Some(ValueSource::CommandLine),
+            wrap_padding: matches.value_source("wrap_padding") == Some(ValueSource::CommandLine),
             retry: matches.value_source("retry") == Some(ValueSource::CommandLine),
             retry_interval: matches.value_source("retry_interval")
                 == Some(ValueSource::CommandLine),
@@ -274,6 +315,27 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
             .as_ref()
             .and_then(|cfg| cfg.remote_serves.as_ref()),
     );
+    let up_connects = choose_string_list(
+        &value.up_connects,
+        value_sources.up_connects,
+        file_config
+            .as_ref()
+            .and_then(|cfg| cfg.up_connects.as_ref()),
+    );
+    let down_connects = choose_string_list(
+        &value.down_connects,
+        value_sources.down_connects,
+        file_config
+            .as_ref()
+            .and_then(|cfg| cfg.down_connects.as_ref()),
+    );
+    let proxy_chain = choose_string_list(
+        &value.proxy_chain,
+        value_sources.proxy_chain,
+        file_config
+            .as_ref()
+            .and_then(|cfg| cfg.proxy_chain.as_ref()),
+    );
 
     let retry = merged_retry_policy(&value, value_sources, file_config.as_ref());
     if retry.interval_secs == 0 {
@@ -292,12 +354,46 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
     let task_request = parse_task_request(&value)?;
     let status_command = parse_status_command(&value)?;
     let control_command = parse_control_command(&value)?;
+    let wrapper = WrapperConfig {
+        compress: if value_sources.wrap_compress {
+            value.wrap_compress
+        } else {
+            file_config
+                .as_ref()
+                .and_then(|cfg| cfg.wrapper.as_ref().map(|wrapper| wrapper.compress))
+                .unwrap_or(value.wrap_compress)
+        },
+        padding: if value_sources.wrap_padding {
+            value.wrap_padding
+        } else {
+            file_config
+                .as_ref()
+                .and_then(|cfg| cfg.wrapper.as_ref().and_then(|wrapper| wrapper.padding))
+                .or(value.wrap_padding)
+        },
+    };
 
     Ok(AppConfig {
         listens: parse_tunnel_list(&listens)?,
         connects: parse_tunnel_list(&connects)?,
+        up_connects: parse_tunnel_list(&up_connects)?,
+        down_connects: parse_tunnel_list(&down_connects)?,
         local_serves: parse_serve_list(&local_serves)?,
         remote_serves: parse_serve_list(&remote_serves)?,
+        proxy_chain,
+        front_proxy: choose_option_string(
+            value.front_proxy,
+            value_sources.front_proxy,
+            file_config.as_ref().and_then(|cfg| cfg.front_proxy.clone()),
+        ),
+        conn_policy: if value_sources.conn_policy {
+            value.conn_policy
+        } else {
+            file_config
+                .as_ref()
+                .and_then(|cfg| cfg.conn_policy.clone())
+                .unwrap_or(value.conn_policy)
+        },
         remote_peer_id: choose_option_string(
             value.remote_peer,
             value_sources.remote_peer,
@@ -326,6 +422,7 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
             ),
         },
         retry,
+        wrapper,
         task_request,
         status_command,
         control_command,
@@ -748,5 +845,46 @@ mod tests {
             cfg.control_command.unwrap(),
             crate::app::config::ControlCommandConfig::ServicesList { json: false }
         ));
+    }
+
+    #[test]
+    fn parse_phase5_connect_options() {
+        let args = CliArgs::parse_from([
+            "fusion",
+            "--up-connect",
+            "tcp://127.0.0.1:1001",
+            "--down-connect",
+            "ws://127.0.0.1:1002/tunnel",
+            "-x",
+            "socks5://127.0.0.1:1080",
+            "-f",
+            "http://127.0.0.1:8080",
+            "--conn-policy",
+            "round-robin",
+        ]);
+        let cfg = AppConfig::try_from(args).unwrap();
+        assert_eq!(cfg.up_connects.len(), 1);
+        assert_eq!(cfg.down_connects.len(), 1);
+        assert_eq!(cfg.proxy_chain, vec!["socks5://127.0.0.1:1080"]);
+        assert_eq!(cfg.front_proxy.as_deref(), Some("http://127.0.0.1:8080"));
+        assert!(matches!(
+            cfg.conn_policy,
+            crate::app::config::ConnPolicy::RoundRobin
+        ));
+    }
+
+    #[test]
+    fn parse_wrapper_options() {
+        let args = CliArgs::parse_from([
+            "fusion",
+            "--wrap-compress",
+            "--wrap-padding",
+            "64",
+            "-c",
+            "tcp://127.0.0.1:1001",
+        ]);
+        let cfg = AppConfig::try_from(args).unwrap();
+        assert!(cfg.wrapper.compress);
+        assert_eq!(cfg.wrapper.padding, Some(64));
     }
 }

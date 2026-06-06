@@ -7,17 +7,20 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
+    time::{sleep, Duration},
 };
 
 use crate::{
     agent::{identity::AgentIdentity, registry::AgentRegistry},
     app::{
+        config::ConnPolicy,
         config::TunnelEndpoint,
         runtime::build_stream_target_label,
         runtime_bridge::{
             build_stream_close_frame, build_stream_data_frame, expect_stream_close_ack,
             write_next_stream_data_to_client,
         },
+        upstream_pool::{TcpMuxUpstreamPool, WsMuxUpstreamPool},
     },
     protocol::{
         frame::{Frame, MessageType},
@@ -33,31 +36,15 @@ use crate::{
 
 pub async fn run_outbound_http_once(
     identity: AgentIdentity,
-    endpoint: &TunnelEndpoint,
+    endpoints: &[TunnelEndpoint],
     local_http_definition: ServiceDefinition,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
+    conn_policy: ConnPolicy,
+    proxy_chain: Vec<String>,
 ) -> Result<(), Error> {
-    let connect_host = endpoint
-        .url
-        .host
-        .clone()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing host for tcp connect"))?;
-    let connect_port = endpoint
-        .url
-        .port
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing port for tcp connect"))?;
-    let connect_addr = format!("{}:{}", connect_host, connect_port);
-    let peer = tcp_mux::connect_mux_peer(identity, &connect_addr).await?;
-    hub.lock().await.upsert(peer.session.clone());
-    registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.outbound.peer={} to={} via=tcp",
-        peer.session.remote.agent_id, connect_addr
-    );
-
     let http_service = match local_http_definition.kind {
         ServiceKind::LocalHttpProxy(service) => service,
         _ => {
@@ -71,23 +58,35 @@ pub async fn run_outbound_http_once(
     let listener = TcpListener::bind(http_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
+    let upstream_pool = TcpMuxUpstreamPool::new();
+    spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!("service.local.active=http://{}", local_addr);
 
     loop {
         let (client, client_addr) = listener.accept().await?;
         println!("service.local.client={} via=http", client_addr);
-        let peer = peer.clone();
+        let endpoints = endpoints.to_vec();
+        let identity = identity.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
+        let hub = hub.clone();
+        let conn_policy = conn_policy.clone();
+        let proxy_chain = proxy_chain.clone();
+        let upstream_pool = upstream_pool.clone();
         let stream_id = allocator.next();
         tokio::spawn(async move {
-            if let Err(err) = handle_outbound_http_client(
-                peer,
+            if let Err(err) = handle_outbound_http_client_with_failover_tcp(
+                upstream_pool,
+                identity,
+                endpoints,
+                conn_policy,
+                proxy_chain,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
                 stream_id,
+                hub,
                 registry,
             )
             .await
@@ -121,21 +120,14 @@ pub async fn handle_outbound_http_client(
 
 pub async fn run_outbound_http_ws_once(
     identity: AgentIdentity,
-    endpoint: &TunnelEndpoint,
+    endpoints: &[TunnelEndpoint],
     local_http_definition: ServiceDefinition,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
+    conn_policy: ConnPolicy,
 ) -> Result<(), Error> {
-    let peer = ws_mux::connect_mux_peer(identity, &endpoint.url.original).await?;
-    hub.lock().await.upsert(peer.session.clone());
-    registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.outbound.peer={} to={} via=ws",
-        peer.session.remote.agent_id, endpoint.url.original
-    );
-
     let http_service = match local_http_definition.kind {
         ServiceKind::LocalHttpProxy(service) => service,
         _ => {
@@ -149,23 +141,33 @@ pub async fn run_outbound_http_ws_once(
     let listener = TcpListener::bind(http_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
+    let upstream_pool = WsMuxUpstreamPool::new();
+    spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!("service.local.active=http://{}", local_addr);
 
     loop {
         let (client, client_addr) = listener.accept().await?;
         println!("service.local.client={} via=http", client_addr);
-        let peer = peer.clone();
+        let endpoints = endpoints.to_vec();
+        let identity = identity.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
+        let hub = hub.clone();
+        let conn_policy = conn_policy.clone();
+        let upstream_pool = upstream_pool.clone();
         let stream_id = allocator.next();
         tokio::spawn(async move {
-            if let Err(err) = handle_outbound_http_ws_client(
-                peer,
+            if let Err(err) = handle_outbound_http_client_with_failover_ws(
+                upstream_pool,
+                identity,
+                endpoints,
+                conn_policy,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
                 stream_id,
+                hub,
                 registry,
             )
             .await
@@ -376,4 +378,173 @@ async fn send_stream_data_ws(
         bytes,
     );
     peer.send_frame(&payload).await
+}
+
+async fn connect_selected_http_peer_tcp(
+    upstream_pool: TcpMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: &[TunnelEndpoint],
+    conn_policy: &ConnPolicy,
+    proxy_chain: &[String],
+    hub: &Arc<Mutex<SessionHub>>,
+    registry: &Arc<Mutex<AgentRegistry>>,
+) -> Result<(String, tcp_mux::MuxTcpPeer), Error> {
+    upstream_pool
+        .acquire(identity, endpoints, conn_policy, proxy_chain, hub, registry)
+        .await
+}
+
+async fn connect_selected_http_peer_ws(
+    upstream_pool: WsMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: &[TunnelEndpoint],
+    conn_policy: &ConnPolicy,
+    hub: &Arc<Mutex<SessionHub>>,
+    registry: &Arc<Mutex<AgentRegistry>>,
+) -> Result<(String, ws_mux::MuxWsPeer), Error> {
+    upstream_pool
+        .acquire(identity, endpoints, conn_policy, hub, registry)
+        .await
+}
+
+async fn handle_outbound_http_client_with_failover_tcp(
+    upstream_pool: TcpMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: Vec<TunnelEndpoint>,
+    conn_policy: ConnPolicy,
+    proxy_chain: Vec<String>,
+    remote_raw_definition: ServiceDefinition,
+    remote_peer_id: Option<String>,
+    mut client: TcpStream,
+    stream_id: u32,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+) -> Result<(), Error> {
+    let request = read_http_proxy_request(&mut client).await?;
+    let attempts = endpoints.len().max(1);
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let (key, peer) = match connect_selected_http_peer_tcp(
+            upstream_pool.clone(),
+            identity.clone(),
+            &endpoints,
+            &conn_policy,
+            &proxy_chain,
+            &hub,
+            &registry,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        println!("upstream.pool.reuse=tcp endpoint={key}");
+        match handle_http_proxy_client_inner(
+            peer,
+            remote_raw_definition.clone(),
+            remote_peer_id.clone(),
+            &mut client,
+            stream_id,
+            registry.clone(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                upstream_pool.invalidate(&key).await;
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::other("no http tcp upstream succeeded")))
+}
+
+async fn handle_outbound_http_client_with_failover_ws(
+    upstream_pool: WsMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: Vec<TunnelEndpoint>,
+    conn_policy: ConnPolicy,
+    remote_raw_definition: ServiceDefinition,
+    remote_peer_id: Option<String>,
+    mut client: TcpStream,
+    stream_id: u32,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+) -> Result<(), Error> {
+    let request = read_http_proxy_request(&mut client).await?;
+    let attempts = endpoints.len().max(1);
+    let mut last_err = None;
+    for _ in 0..attempts {
+        let (key, peer) = match connect_selected_http_peer_ws(
+            upstream_pool.clone(),
+            identity.clone(),
+            &endpoints,
+            &conn_policy,
+            &hub,
+            &registry,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        };
+        println!("upstream.pool.reuse=ws endpoint={key}");
+        match handle_http_proxy_ws_client_inner(
+            peer,
+            remote_raw_definition.clone(),
+            remote_peer_id.clone(),
+            &mut client,
+            stream_id,
+            registry.clone(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                upstream_pool.invalidate(&key).await;
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| Error::other("no http ws upstream succeeded")))
+}
+
+fn spawn_tcp_upstream_pool_maintenance(
+    pool: TcpMuxUpstreamPool,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            let removed = pool.prune_stale(&hub, &registry).await;
+            if removed > 0 {
+                eprintln!("upstream.pool.pruned transport=tcp removed={removed}");
+            }
+        }
+    });
+}
+
+fn spawn_ws_upstream_pool_maintenance(
+    pool: WsMuxUpstreamPool,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+            let removed = pool.prune_stale(&hub, &registry).await;
+            if removed > 0 {
+                eprintln!("upstream.pool.pruned transport=ws removed={removed}");
+            }
+        }
+    });
 }

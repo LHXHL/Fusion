@@ -1,10 +1,6 @@
 use std::io::{Error, ErrorKind};
 
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-    sync::mpsc,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, sync::mpsc};
 
 use crate::protocol::{
     frame::{Frame, MessageType},
@@ -104,7 +100,11 @@ mod tests {
         frame::MessageType,
         message::{Message, StreamCloseMessage},
     };
-    use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}, sync::mpsc};
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+    };
 
     async fn tcp_socket_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,9 +129,14 @@ mod tests {
     async fn write_next_stream_data_to_client_writes_payload() {
         let (mut client, mut server) = tcp_socket_pair().await;
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send(build_stream_data_frame("local-a", "remote-b", 9, b"bridge-ok"))
-            .await
-            .unwrap();
+        tx.send(build_stream_data_frame(
+            "local-a",
+            "remote-b",
+            9,
+            b"bridge-ok",
+        ))
+        .await
+        .unwrap();
 
         let wrote = write_next_stream_data_to_client(&mut rx, &mut server, 9, "bridge")
             .await
@@ -151,7 +156,9 @@ mod tests {
                 MessageType::StreamClose,
                 Some("local-a".into()),
                 Some("remote-b".into()),
-                Message::StreamClose(StreamCloseMessage { reason: Some("ok".into()) }),
+                Message::StreamClose(StreamCloseMessage {
+                    reason: Some("ok".into()),
+                }),
             )
             .with_stream_id(11),
         )

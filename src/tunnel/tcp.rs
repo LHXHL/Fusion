@@ -16,6 +16,7 @@ use crate::{
         heartbeat::heartbeat_frame,
         peer::{PeerInfo, PeerSession, SessionState},
     },
+    tunnel::proxy::connect_via_proxy_chain,
 };
 
 #[derive(Debug)]
@@ -42,6 +43,22 @@ pub async fn bind(endpoint: &str) -> Result<TcpListener, Error> {
 
 pub async fn connect(endpoint: &str) -> Result<TcpStream, Error> {
     TcpStream::connect(endpoint).await
+}
+
+pub async fn connect_via_proxy(endpoint: &str, proxy_chain: &[String]) -> Result<TcpStream, Error> {
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid tcp endpoint `{endpoint}`"),
+        )
+    })?;
+    let port = port.parse::<u16>().map_err(|err| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid tcp endpoint port in `{endpoint}`: {err}"),
+        )
+    })?;
+    connect_via_proxy_chain(host, port, proxy_chain).await
 }
 
 pub async fn write_frame(stream: &mut TcpStream, frame: &Frame) -> Result<(), Error> {
@@ -115,7 +132,19 @@ pub async fn accept_peer_on(
 }
 
 pub async fn connect_peer(identity: AgentIdentity, endpoint: &str) -> Result<ActiveTcpPeer, Error> {
-    let mut stream = connect(endpoint).await?;
+    connect_peer_via_proxy_chain(identity, endpoint, &[]).await
+}
+
+pub async fn connect_peer_via_proxy_chain(
+    identity: AgentIdentity,
+    endpoint: &str,
+    proxy_chain: &[String],
+) -> Result<ActiveTcpPeer, Error> {
+    let mut stream = if proxy_chain.is_empty() {
+        connect(endpoint).await?
+    } else {
+        connect_via_proxy(endpoint, proxy_chain).await?
+    };
     let peer_addr = stream.peer_addr()?;
     let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
 
@@ -179,6 +208,15 @@ pub async fn run_outbound_session_once(
     endpoint: &str,
 ) -> Result<(PeerSession, Vec<Frame>), Error> {
     let peer = connect_peer(identity, endpoint).await?;
+    Ok((peer.session, Vec::new()))
+}
+
+pub async fn run_outbound_session_once_via_proxy_chain(
+    identity: AgentIdentity,
+    endpoint: &str,
+    proxy_chain: &[String],
+) -> Result<(PeerSession, Vec<Frame>), Error> {
+    let peer = connect_peer_via_proxy_chain(identity, endpoint, proxy_chain).await?;
     Ok((peer.session, Vec::new()))
 }
 

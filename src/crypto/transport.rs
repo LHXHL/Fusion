@@ -3,7 +3,7 @@ use std::io::{Error, ErrorKind};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    crypto::wrapper::{payload_looks_wrapped, WrapperPipeline},
+    crypto::wrapper::{global_wrapper_config, payload_looks_wrapped, WrapperPipeline},
     protocol::{codec, frame::Frame},
 };
 
@@ -28,14 +28,36 @@ pub fn encode_transport_frame(
     shared_key: Option<&SharedKey>,
 ) -> Result<Vec<u8>, Error> {
     let plain = codec::encode_frame(frame)?;
-    WrapperPipeline::from_shared_key(shared_key).wrap(plain)
+    WrapperPipeline::from_config(&global_wrapper_config(), shared_key).wrap(plain)
+}
+
+pub fn encode_transport_frame_with_pipeline(
+    frame: &Frame,
+    pipeline: &WrapperPipeline,
+) -> Result<Vec<u8>, Error> {
+    let plain = codec::encode_frame(frame)?;
+    pipeline.wrap(plain)
 }
 
 pub fn decode_transport_frame(
     bytes: &[u8],
     shared_key: Option<&SharedKey>,
 ) -> Result<Frame, Error> {
-    let pipeline = WrapperPipeline::from_shared_key(shared_key);
+    let pipeline = WrapperPipeline::from_config(&global_wrapper_config(), shared_key);
+    if !pipeline.requires_wrapped_input() && payload_looks_wrapped(bytes) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "received wrapped transport frame but no local wrapper is configured",
+        ));
+    }
+    let plain = pipeline.unwrap(bytes)?;
+    codec::decode_frame(&plain)
+}
+
+pub fn decode_transport_frame_with_pipeline(
+    bytes: &[u8],
+    pipeline: &WrapperPipeline,
+) -> Result<Frame, Error> {
     if !pipeline.requires_wrapped_input() && payload_looks_wrapped(bytes) {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -48,12 +70,16 @@ pub fn decode_transport_frame(
 
 #[cfg(test)]
 mod tests {
+    use crate::crypto::wrapper::{WrapperConfig, WrapperPipeline};
     use crate::protocol::{
         frame::{Frame, MessageType},
         message::{HelloMessage, Message},
     };
 
-    use super::{decode_transport_frame, encode_transport_frame, SharedKey};
+    use super::{
+        decode_transport_frame, decode_transport_frame_with_pipeline, encode_transport_frame,
+        encode_transport_frame_with_pipeline, SharedKey,
+    };
 
     fn sample_frame() -> Frame {
         Frame::new(
@@ -95,5 +121,21 @@ mod tests {
 
         let plain = encode_transport_frame(&frame, None).unwrap();
         assert!(decode_transport_frame(&plain, Some(&key)).is_err());
+    }
+
+    #[test]
+    fn transport_frame_roundtrip_with_multi_stage_pipeline() {
+        let frame = sample_frame();
+        let key = SharedKey::from_secret("fusion-secret");
+        let pipeline = WrapperPipeline::from_config(
+            &WrapperConfig {
+                compress: true,
+                padding: Some(16),
+            },
+            Some(&key),
+        );
+        let encoded = encode_transport_frame_with_pipeline(&frame, &pipeline).unwrap();
+        let decoded = decode_transport_frame_with_pipeline(&encoded, &pipeline).unwrap();
+        assert_eq!(decoded, frame);
     }
 }

@@ -1,7 +1,10 @@
 use crate::{
     agent::identity::AgentIdentity,
     app::{
-        config::{AgentIdentityConfig, AppConfig, RetryPolicy, ServeEndpoint, StatusScope, TaskRequestConfig, TunnelEndpoint},
+        config::{
+            AgentIdentityConfig, AppConfig, RetryPolicy, ServeEndpoint, StatusScope,
+            TaskRequestConfig, TunnelEndpoint,
+        },
         runtime_http::{handle_outbound_http_client, handle_outbound_http_ws_client},
         runtime_orchestrator::{spawn_inbound_tasks, spawn_outbound_tasks, RuntimeShared},
         runtime_relay::{handle_tcp_relay_stream_open, handle_ws_relay_stream_open},
@@ -847,8 +850,6 @@ async fn ws_socks5_over_relay_roundtrip() {
     target_task.await.unwrap();
 }
 
-
-
 #[tokio::test]
 async fn tcp_http_proxy_over_relay_roundtrip() {
     let http_listener = bind("127.0.0.1:0").await.unwrap();
@@ -1137,7 +1138,6 @@ async fn ws_http_connect_over_relay_roundtrip() {
     target_task.abort();
 }
 
-
 #[tokio::test]
 async fn udp_inbound_runtime_registers_direct_session() {
     let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1156,14 +1156,20 @@ async fn udp_inbound_runtime_registers_direct_session() {
             url: ParsedUrl::parse(&format!("udp://127.0.0.1:{port}")).unwrap(),
         }],
         connects: vec![],
+        up_connects: vec![],
+        down_connects: vec![],
         local_serves: vec![],
         remote_serves: vec![],
+        proxy_chain: vec![],
+        front_proxy: None,
+        conn_policy: crate::app::config::ConnPolicy::Fallback,
         remote_peer_id: None,
         identity: AgentIdentityConfig {
             name: Some("udp-runtime-listener".into()),
             key: None,
         },
         retry: RetryPolicy::default(),
+        wrapper: crate::crypto::wrapper::WrapperConfig::default(),
         task_request: None,
         status_command: None,
         control_command: None,
@@ -1188,8 +1194,13 @@ async fn udp_inbound_runtime_registers_direct_session() {
         connects: vec![TunnelEndpoint {
             url: ParsedUrl::parse(&format!("udp://127.0.0.1:{port}")).unwrap(),
         }],
+        up_connects: vec![],
+        down_connects: vec![],
         local_serves: vec![],
         remote_serves: vec![],
+        proxy_chain: vec![],
+        front_proxy: None,
+        conn_policy: crate::app::config::ConnPolicy::Fallback,
         remote_peer_id: None,
         identity: AgentIdentityConfig {
             name: Some("udp-runtime-dialer".into()),
@@ -1200,6 +1211,7 @@ async fn udp_inbound_runtime_registers_direct_session() {
             interval_secs: 1,
             max_interval_secs: 1,
         },
+        wrapper: crate::crypto::wrapper::WrapperConfig::default(),
         task_request: None,
         status_command: None,
         control_command: None,
@@ -1212,6 +1224,7 @@ async fn udp_inbound_runtime_registers_direct_session() {
         &outbound_config,
         &dialer_identity,
         &shared,
+        None,
         None,
         None,
         None,
@@ -1230,6 +1243,123 @@ async fn udp_inbound_runtime_registers_direct_session() {
     let peers = shared.registry.lock().await.peers_snapshot();
     assert!(!sessions.is_empty());
     assert!(!peers.is_empty());
-    assert!(sessions.iter().any(|s| s.remote.agent_name == "udp-runtime-dialer"));
-    assert!(peers.iter().any(|p| p.session.remote.agent_name == "udp-runtime-dialer"));
+    assert!(sessions
+        .iter()
+        .any(|s| s.remote.agent_name == "udp-runtime-dialer"));
+    assert!(peers
+        .iter()
+        .any(|p| p.session.remote.agent_name == "udp-runtime-dialer"));
+}
+
+#[tokio::test]
+async fn simplex_http_inbound_runtime_registers_direct_session() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let data_dir = std::env::temp_dir().join(format!(
+        "fusion-simplex-http-runtime-test-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let shared = RuntimeShared::new(Vec::new(), &data_dir).await;
+
+    let listener_config = AppConfig {
+        listens: vec![TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("simplex+http://127.0.0.1:{port}/runtime")).unwrap(),
+        }],
+        connects: vec![],
+        up_connects: vec![],
+        down_connects: vec![],
+        local_serves: vec![],
+        remote_serves: vec![],
+        proxy_chain: vec![],
+        front_proxy: None,
+        conn_policy: crate::app::config::ConnPolicy::Fallback,
+        remote_peer_id: None,
+        identity: AgentIdentityConfig {
+            name: Some("simplex-http-runtime-listener".into()),
+            key: None,
+        },
+        retry: RetryPolicy::default(),
+        wrapper: crate::crypto::wrapper::WrapperConfig::default(),
+        task_request: None,
+        status_command: None,
+        control_command: None,
+        config_file: None,
+        data_dir: data_dir.clone(),
+        log_level: "info".into(),
+    };
+    let listener_identity = AgentIdentity::from_config(&listener_config.identity);
+    let inbound_tasks = spawn_inbound_tasks(
+        &listener_config,
+        &listener_identity,
+        &shared,
+        None,
+        false,
+        &[],
+    )
+    .await;
+    assert_eq!(inbound_tasks.len(), 1);
+
+    let outbound_config = AppConfig {
+        listens: vec![],
+        connects: vec![TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("simplex+http://127.0.0.1:{port}/runtime")).unwrap(),
+        }],
+        up_connects: vec![],
+        down_connects: vec![],
+        local_serves: vec![],
+        remote_serves: vec![],
+        proxy_chain: vec![],
+        front_proxy: None,
+        conn_policy: crate::app::config::ConnPolicy::Fallback,
+        remote_peer_id: None,
+        identity: AgentIdentityConfig {
+            name: Some("simplex-http-runtime-dialer".into()),
+            key: None,
+        },
+        retry: RetryPolicy {
+            max_retries: Some(1),
+            interval_secs: 1,
+            max_interval_secs: 1,
+        },
+        wrapper: crate::crypto::wrapper::WrapperConfig::default(),
+        task_request: None,
+        status_command: None,
+        control_command: None,
+        config_file: None,
+        data_dir: data_dir.clone(),
+        log_level: "info".into(),
+    };
+    let dialer_identity = AgentIdentity::from_config(&outbound_config.identity);
+    let outbound_tasks = spawn_outbound_tasks(
+        &outbound_config,
+        &dialer_identity,
+        &shared,
+        None,
+        None,
+        None,
+        None,
+        &[],
+    );
+    assert_eq!(outbound_tasks.len(), 1);
+
+    for task in outbound_tasks {
+        task.await.unwrap();
+    }
+    for task in inbound_tasks {
+        task.await.unwrap();
+    }
+
+    let sessions = shared.hub.lock().await.sessions_snapshot();
+    let peers = shared.registry.lock().await.peers_snapshot();
+    assert!(!sessions.is_empty());
+    assert!(!peers.is_empty());
+    assert!(sessions
+        .iter()
+        .any(|s| s.remote.agent_name == "simplex-http-runtime-dialer"));
+    assert!(peers
+        .iter()
+        .any(|p| p.session.remote.agent_name == "simplex-http-runtime-dialer"));
 }

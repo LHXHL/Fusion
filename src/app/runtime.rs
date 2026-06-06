@@ -14,6 +14,7 @@ use crate::{
         },
         runtime_status::{print_control_snapshot, print_status_snapshot},
     },
+    crypto::wrapper::set_global_wrapper_config,
 };
 
 pub(crate) fn build_stream_target_label(host: &Option<String>, port: Option<u16>) -> String {
@@ -32,6 +33,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
     }
 
     info!("starting fusion unified runtime");
+    set_global_wrapper_config(config.wrapper.clone());
     let identity = AgentIdentity::from_config(&config.identity);
     emit_bootstrap_summary(&config, &identity)?;
 
@@ -47,6 +49,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         inbound_raw_service,
         outbound_socks5_service,
         outbound_http_proxy_service,
+        outbound_shadowsocks_service,
         outbound_egress_service,
         remote_port_forward_services,
     ) = find_runtime_services(&prepared.local_services, &prepared.remote_services);
@@ -70,6 +73,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         &shared,
         outbound_socks5_service,
         outbound_http_proxy_service,
+        outbound_shadowsocks_service,
         outbound_egress_service,
         &prepared.exposed_service_labels,
     ));

@@ -64,10 +64,7 @@ pub async fn send_frame_with_key(
     }
     let written = socket.send(&payload).await?;
     if written != payload.len() {
-        return Err(Error::new(
-            ErrorKind::WriteZero,
-            "short udp datagram write",
-        ));
+        return Err(Error::new(ErrorKind::WriteZero, "short udp datagram write"));
     }
     Ok(())
 }
@@ -196,7 +193,9 @@ mod tests {
             frame::{Frame, MessageType},
             message::{Message, StreamCloseMessage, StreamOpenMessage},
         },
-        tunnel::udp::{accept_peer, bind, connect_peer, run_inbound_session_once, run_outbound_session_once},
+        tunnel::udp::{
+            accept_peer, bind, connect_peer, run_inbound_session_once, run_outbound_session_once,
+        },
     };
 
     #[tokio::test]
@@ -266,7 +265,9 @@ mod tests {
             peer.send_frame(&close).await.unwrap();
         });
 
-        let peer = connect_peer(client_identity, &addr.to_string()).await.unwrap();
+        let peer = connect_peer(client_identity, &addr.to_string())
+            .await
+            .unwrap();
         let open = Frame::new(
             MessageType::StreamOpen,
             Some(peer.session.local.agent_id.clone()),

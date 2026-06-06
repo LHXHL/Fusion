@@ -3,9 +3,23 @@ use std::{
     path::PathBuf,
 };
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::{protocol::message::TaskAction, utils::url::ParsedUrl};
+use crate::{crypto::wrapper::WrapperConfig, protocol::message::TaskAction, utils::url::ParsedUrl};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+pub enum ConnPolicy {
+    Fallback,
+    Random,
+    RoundRobin,
+}
+
+impl Default for ConnPolicy {
+    fn default() -> Self {
+        Self::Fallback
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
@@ -70,11 +84,17 @@ pub struct FileAgentIdentityConfig {
 pub struct FileAppConfig {
     pub listens: Option<Vec<String>>,
     pub connects: Option<Vec<String>>,
+    pub up_connects: Option<Vec<String>>,
+    pub down_connects: Option<Vec<String>>,
     pub local_serves: Option<Vec<String>>,
     pub remote_serves: Option<Vec<String>>,
+    pub proxy_chain: Option<Vec<String>>,
+    pub front_proxy: Option<String>,
+    pub conn_policy: Option<ConnPolicy>,
     pub remote_peer_id: Option<String>,
     pub identity: Option<FileAgentIdentityConfig>,
     pub retry: Option<FileRetryPolicy>,
+    pub wrapper: Option<WrapperConfig>,
     pub data_dir: Option<PathBuf>,
     pub log_level: Option<String>,
 }
@@ -101,11 +121,17 @@ pub struct ServeEndpoint {
 pub struct AppConfig {
     pub listens: Vec<TunnelEndpoint>,
     pub connects: Vec<TunnelEndpoint>,
+    pub up_connects: Vec<TunnelEndpoint>,
+    pub down_connects: Vec<TunnelEndpoint>,
     pub local_serves: Vec<ServeEndpoint>,
     pub remote_serves: Vec<ServeEndpoint>,
+    pub proxy_chain: Vec<String>,
+    pub front_proxy: Option<String>,
+    pub conn_policy: ConnPolicy,
     pub remote_peer_id: Option<String>,
     pub identity: AgentIdentityConfig,
     pub retry: RetryPolicy,
+    pub wrapper: WrapperConfig,
     pub task_request: Option<TaskRequestConfig>,
     pub status_command: Option<StatusCommandConfig>,
     pub control_command: Option<ControlCommandConfig>,
@@ -123,8 +149,15 @@ impl AppConfig {
             ),
             format!("listen.count={}", self.listens.len()),
             format!("connect.count={}", self.connects.len()),
+            format!("up_connect.count={}", self.up_connects.len()),
+            format!("down_connect.count={}", self.down_connects.len()),
             format!("local_serve.count={}", self.local_serves.len()),
             format!("remote_serve.count={}", self.remote_serves.len()),
+            format!(
+                "proxy.chain.count={}",
+                self.proxy_chain.len() + usize::from(self.front_proxy.is_some())
+            ),
+            format!("conn.policy={:?}", self.conn_policy),
             format!(
                 "remote.peer={}",
                 self.remote_peer_id.as_deref().unwrap_or("<direct>")
@@ -137,6 +170,14 @@ impl AppConfig {
                         Some(path) => format!("{:?}@{}", task.action, path.display()),
                         None => format!("{:?}", task.action),
                     })
+                    .unwrap_or_else(|| "disabled".to_string())
+            ),
+            format!(
+                "wrapper.mode=compress:{},padding:{}",
+                self.wrapper.compress,
+                self.wrapper
+                    .padding
+                    .map(|value| value.to_string())
                     .unwrap_or_else(|| "disabled".to_string())
             ),
             format!(

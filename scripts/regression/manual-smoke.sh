@@ -48,6 +48,9 @@ echo "[INFO] temp root: $TMP_ROOT"
 cargo build --bin fusion >/dev/null
 pass "cargo build --bin fusion"
 
+cargo build --lib >/dev/null
+pass "cargo build --lib"
+
 cargo run --quiet --bin fusion -- --help >/dev/null
 pass "fusion --help"
 
@@ -134,6 +137,60 @@ PIDS+=("$!")
 wait_for_log "$WS_A_LOG" 'session.inbound.peer=' || fail "ws inbound peer established"
 pass "双节点 WS 互连"
 
+UNIX_A_DIR="$TMP_ROOT/unix-a"
+UNIX_B_DIR="$TMP_ROOT/unix-b"
+UNIX_A_LOG="$TMP_ROOT/unix-a.log"
+UNIX_B_LOG="$TMP_ROOT/unix-b.log"
+UNIX_SOCKET="$TMP_ROOT/fusion-unix.sock"
+mkdir -p "$UNIX_A_DIR" "$UNIX_B_DIR"
+LOGS+=("$UNIX_A_LOG" "$UNIX_B_LOG")
+
+cargo run --quiet --bin fusion -- \
+  --data-dir "$UNIX_A_DIR" \
+  -s "unix://$UNIX_SOCKET" \
+  -a smoke-unix-a \
+  >"$UNIX_A_LOG" 2>&1 &
+PIDS+=("$!")
+wait_for_log "$UNIX_A_LOG" 'listen.active=unix://' || fail "unix listener startup"
+
+cargo run --quiet --bin fusion -- \
+  --data-dir "$UNIX_B_DIR" \
+  -c "unix://$UNIX_SOCKET" \
+  -a smoke-unix-b \
+  >"$UNIX_B_LOG" 2>&1
+grep -q 'via=unix' "$UNIX_B_LOG" || fail "unix outbound session log"
+pass "双节点 Unix 互连"
+
+cargo test -q memory_session_hello_heartbeat_roundtrip
+pass "双节点 Memory 互连"
+
+cargo test -q simplex_http
+pass "simplex+http 最小 direct session"
+
+UDP_A_DIR="$TMP_ROOT/udp-a"
+UDP_B_DIR="$TMP_ROOT/udp-b"
+mkdir -p "$UDP_A_DIR" "$UDP_B_DIR"
+UDP_A_LOG="$TMP_ROOT/udp-a.log"
+UDP_B_LOG="$TMP_ROOT/udp-b.log"
+LOGS+=("$UDP_A_LOG" "$UDP_B_LOG")
+
+cargo run --quiet --bin fusion -- \
+  --data-dir "$UDP_A_DIR" \
+  -s udp://127.0.0.1:39240 \
+  -a smoke-udp-a \
+  >"$UDP_A_LOG" 2>&1 &
+PIDS+=("$!")
+wait_for_log "$UDP_A_LOG" 'listen.active=udp://127.0.0.1:39240' || fail "udp listener startup"
+
+cargo run --quiet --bin fusion -- \
+  --data-dir "$UDP_B_DIR" \
+  -c udp://127.0.0.1:39240 \
+  -a smoke-udp-b \
+  >"$UDP_B_LOG" 2>&1
+wait_for_log "$UDP_A_LOG" 'session.peer=' || fail "udp inbound peer established"
+grep -q 'via=udp' "$UDP_B_LOG" || fail "udp outbound session log"
+pass "双节点 UDP 互连"
+
 TASK_DIR="$TMP_ROOT/task"
 mkdir -p "$TASK_DIR"
 TASK_LOG="$TMP_ROOT/task.log"
@@ -185,5 +242,14 @@ assert resp == b'port-smoke', resp
 s.close()
 PY
 pass "port:// 固定端口转发"
+
+cargo test -q tcp_http_proxy_over_relay_roundtrip
+pass "HTTP Proxy -> raw 动态出口"
+
+cargo test -q connects_via_http_connect_proxy
+pass "HTTP CONNECT 代理链基础能力"
+
+cargo test -q wss_mux_handshake_and_stream_roundtrip_with_insecure_client
+pass "WSS 单跳握手与流转发"
 
 echo "[PASS] manual smoke completed"

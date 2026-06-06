@@ -3,6 +3,13 @@ use std::{
     sync::Arc,
 };
 
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+    time::{sleep, Duration},
+};
+
 use crate::{
     agent::{identity::AgentIdentity, registry::AgentRegistry},
     app::{
@@ -20,23 +27,17 @@ use crate::{
         message::Message,
     },
     serve::{
-        service::{build_remote_stream_open_for_request, ServiceDefinition, ServiceKind},
-        socks5::{accept_no_auth, read_connect_request, write_success_response},
+        service::{build_remote_stream_open_for_target, ServiceDefinition, ServiceKind},
+        shadowsocks::{parse_shadowsocks_request, ShadowsocksRequest},
     },
     session::{hub::SessionHub, stream::StreamIdAllocator},
     tunnel::{tcp_mux, ws_mux},
 };
-use tokio::{
-    io::AsyncReadExt,
-    net::{TcpListener, TcpStream},
-    sync::Mutex,
-    time::{sleep, Duration},
-};
 
-pub async fn run_outbound_socks5_once(
+pub async fn run_outbound_shadowsocks_once(
     identity: AgentIdentity,
     endpoints: &[TunnelEndpoint],
-    local_socks_definition: ServiceDefinition,
+    local_ss_definition: ServiceDefinition,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     hub: Arc<Mutex<SessionHub>>,
@@ -44,26 +45,30 @@ pub async fn run_outbound_socks5_once(
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
 ) -> Result<(), Error> {
-    let socks_service = match local_socks_definition.kind {
-        ServiceKind::LocalSocks5(service) => service,
+    let ss_service = match local_ss_definition.kind {
+        ServiceKind::LocalShadowsocks(service) => service,
         _ => {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                "outbound socks5 handler requires local socks5 service",
+                "outbound shadowsocks handler requires local ss service",
             ))
         }
     };
 
-    let listener = TcpListener::bind(socks_service.bind_label()).await?;
+    let listener = TcpListener::bind(ss_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = TcpMuxUpstreamPool::new();
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=socks5://{}", local_addr);
+    println!(
+        "service.local.active=ss://{}{}",
+        local_addr,
+        ss_service.summary_suffix()
+    );
 
     loop {
         let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=socks5", client_addr);
+        println!("service.local.client={} via=ss", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let remote_raw_definition = remote_raw_definition.clone();
@@ -75,7 +80,7 @@ pub async fn run_outbound_socks5_once(
         let upstream_pool = upstream_pool.clone();
         let stream_id = allocator.next();
         tokio::spawn(async move {
-            if let Err(err) = handle_outbound_socks5_client_with_failover_tcp(
+            if let Err(err) = handle_outbound_shadowsocks_client_with_failover_tcp(
                 upstream_pool,
                 identity,
                 endpoints,
@@ -96,119 +101,40 @@ pub async fn run_outbound_socks5_once(
     }
 }
 
-pub async fn handle_outbound_socks5_client(
-    peer: tcp_mux::MuxTcpPeer,
-    remote_raw_definition: ServiceDefinition,
-    remote_peer_id: Option<String>,
-    mut client: TcpStream,
-    stream_id: u32,
-    registry: Arc<Mutex<AgentRegistry>>,
-) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
-    let request = read_connect_request(&mut client).await?;
-    process_outbound_socks5_tcp_request(
-        peer,
-        remote_raw_definition,
-        remote_peer_id,
-        &mut client,
-        stream_id,
-        registry,
-        request,
-    )
-    .await
-}
-
-async fn process_outbound_socks5_tcp_request(
-    peer: tcp_mux::MuxTcpPeer,
-    remote_raw_definition: ServiceDefinition,
-    remote_peer_id: Option<String>,
-    client: &mut TcpStream,
-    stream_id: u32,
-    registry: Arc<Mutex<AgentRegistry>>,
-    request: crate::serve::socks5::Socks5ConnectRequest,
-) -> Result<(), Error> {
-    let mut rx = peer.open_stream_receiver(stream_id).await;
-    let open_message = build_remote_stream_open_for_request(&remote_raw_definition, &request)?;
-    registry.lock().await.open_stream(
-        stream_id,
-        peer.session.remote.agent_id.clone(),
-        open_message.service.clone(),
-        build_stream_target_label(&open_message.target_host, open_message.target_port),
-    );
-    let open = Frame::new(
-        MessageType::StreamOpen,
-        Some(peer.session.local.agent_id.clone()),
-        Some(
-            remote_peer_id
-                .clone()
-                .unwrap_or_else(|| peer.session.remote.agent_id.clone()),
-        ),
-        Message::StreamOpen(open_message),
-    )
-    .with_stream_id(stream_id);
-    peer.send_frame(&open).await?;
-    registry.lock().await.mark_stream_active(stream_id);
-    write_success_response(client).await?;
-
-    loop {
-        let mut buf = [0_u8; 4096];
-        let n = client.read(&mut buf).await?;
-        if n == 0 {
-            registry.lock().await.mark_stream_closing(stream_id);
-            break;
-        }
-
-        let payload = build_stream_data_frame(
-            &peer.session.local.agent_id,
-            &peer.session.remote.agent_id,
-            stream_id,
-            &buf[..n],
-        );
-        peer.send_frame(&payload).await?;
-        write_next_stream_data_to_client(&mut rx, client, stream_id, "socks5").await?;
-    }
-
-    let close = build_stream_close_frame(
-        &peer.session.local.agent_id,
-        &peer.session.remote.agent_id,
-        stream_id,
-    );
-    peer.send_frame(&close).await?;
-    expect_stream_close_ack(&mut rx, stream_id).await?;
-    registry.lock().await.mark_stream_closed(stream_id);
-    Ok(())
-}
-
-pub async fn run_outbound_socks5_ws_once(
+pub async fn run_outbound_shadowsocks_ws_once(
     identity: AgentIdentity,
     endpoints: &[TunnelEndpoint],
-    local_socks_definition: ServiceDefinition,
+    local_ss_definition: ServiceDefinition,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
     conn_policy: ConnPolicy,
 ) -> Result<(), Error> {
-    let socks_service = match local_socks_definition.kind {
-        ServiceKind::LocalSocks5(service) => service,
+    let ss_service = match local_ss_definition.kind {
+        ServiceKind::LocalShadowsocks(service) => service,
         _ => {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
-                "outbound socks5 handler requires local socks5 service",
+                "outbound shadowsocks handler requires local ss service",
             ))
         }
     };
 
-    let listener = TcpListener::bind(socks_service.bind_label()).await?;
+    let listener = TcpListener::bind(ss_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = WsMuxUpstreamPool::new();
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=socks5://{}", local_addr);
+    println!(
+        "service.local.active=ss://{}{}",
+        local_addr,
+        ss_service.summary_suffix()
+    );
 
     loop {
         let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=socks5", client_addr);
+        println!("service.local.client={} via=ss", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let remote_raw_definition = remote_raw_definition.clone();
@@ -219,7 +145,7 @@ pub async fn run_outbound_socks5_ws_once(
         let upstream_pool = upstream_pool.clone();
         let stream_id = allocator.next();
         tokio::spawn(async move {
-            if let Err(err) = handle_outbound_socks5_client_with_failover_ws(
+            if let Err(err) = handle_outbound_shadowsocks_client_with_failover_ws(
                 upstream_pool,
                 identity,
                 endpoints,
@@ -239,44 +165,34 @@ pub async fn run_outbound_socks5_ws_once(
     }
 }
 
-async fn connect_selected_socks5_peer_tcp(
-    upstream_pool: TcpMuxUpstreamPool,
-    identity: AgentIdentity,
-    endpoints: &[TunnelEndpoint],
-    conn_policy: &ConnPolicy,
-    proxy_chain: &[String],
-    hub: &Arc<Mutex<SessionHub>>,
-    registry: &Arc<Mutex<AgentRegistry>>,
-) -> Result<(String, tcp_mux::MuxTcpPeer), Error> {
-    upstream_pool
-        .acquire(identity, endpoints, conn_policy, proxy_chain, hub, registry)
-        .await
+async fn read_shadowsocks_request(client: &mut TcpStream) -> Result<ShadowsocksRequest, Error> {
+    let mut buf = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let n = client.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "shadowsocks client closed before request was complete",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(request) = parse_shadowsocks_request(&buf)? {
+            return Ok(request);
+        }
+    }
 }
 
-async fn connect_selected_socks5_peer_ws(
-    upstream_pool: WsMuxUpstreamPool,
-    identity: AgentIdentity,
-    endpoints: &[TunnelEndpoint],
-    conn_policy: &ConnPolicy,
-    hub: &Arc<Mutex<SessionHub>>,
-    registry: &Arc<Mutex<AgentRegistry>>,
-) -> Result<(String, ws_mux::MuxWsPeer), Error> {
-    upstream_pool
-        .acquire(identity, endpoints, conn_policy, hub, registry)
-        .await
-}
-
-pub async fn handle_outbound_socks5_ws_client(
-    peer: ws_mux::MuxWsPeer,
+pub async fn handle_outbound_shadowsocks_client(
+    peer: tcp_mux::MuxTcpPeer,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
-    let request = read_connect_request(&mut client).await?;
-    process_outbound_socks5_ws_request(
+    let request = read_shadowsocks_request(&mut client).await?;
+    handle_shadowsocks_client_inner(
         peer,
         remote_raw_definition,
         remote_peer_id,
@@ -288,17 +204,42 @@ pub async fn handle_outbound_socks5_ws_client(
     .await
 }
 
-async fn process_outbound_socks5_ws_request(
+pub async fn handle_outbound_shadowsocks_ws_client(
     peer: ws_mux::MuxWsPeer,
+    remote_raw_definition: ServiceDefinition,
+    remote_peer_id: Option<String>,
+    mut client: TcpStream,
+    stream_id: u32,
+    registry: Arc<Mutex<AgentRegistry>>,
+) -> Result<(), Error> {
+    let request = read_shadowsocks_request(&mut client).await?;
+    handle_shadowsocks_ws_client_inner(
+        peer,
+        remote_raw_definition,
+        remote_peer_id,
+        &mut client,
+        stream_id,
+        registry,
+        request,
+    )
+    .await
+}
+
+async fn handle_shadowsocks_client_inner(
+    peer: tcp_mux::MuxTcpPeer,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     client: &mut TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
-    request: crate::serve::socks5::Socks5ConnectRequest,
+    request: ShadowsocksRequest,
 ) -> Result<(), Error> {
     let mut rx = peer.open_stream_receiver(stream_id).await;
-    let open_message = build_remote_stream_open_for_request(&remote_raw_definition, &request)?;
+    let open_message = build_remote_stream_open_for_target(
+        &remote_raw_definition,
+        &request.target_host,
+        request.target_port,
+    )?;
     registry.lock().await.open_stream(
         stream_id,
         peer.session.remote.agent_id.clone(),
@@ -318,7 +259,11 @@ async fn process_outbound_socks5_ws_request(
     .with_stream_id(stream_id);
     peer.send_frame(&open).await?;
     registry.lock().await.mark_stream_active(stream_id);
-    write_success_response(client).await?;
+
+    if !request.initial_payload.is_empty() {
+        send_stream_data_tcp(&peer, stream_id, &request.initial_payload).await?;
+        let _ = write_next_stream_data_to_client(&mut rx, client, stream_id, "ss").await?;
+    }
 
     loop {
         let mut buf = [0_u8; 4096];
@@ -328,14 +273,11 @@ async fn process_outbound_socks5_ws_request(
             break;
         }
 
-        let payload = build_stream_data_frame(
-            &peer.session.local.agent_id,
-            &peer.session.remote.agent_id,
-            stream_id,
-            &buf[..n],
-        );
-        peer.send_frame(&payload).await?;
-        write_next_stream_data_to_client(&mut rx, client, stream_id, "socks5").await?;
+        send_stream_data_tcp(&peer, stream_id, &buf[..n]).await?;
+        if !write_next_stream_data_to_client(&mut rx, client, stream_id, "ss").await? {
+            registry.lock().await.mark_stream_closing(stream_id);
+            break;
+        }
     }
 
     let close = build_stream_close_frame(
@@ -349,7 +291,128 @@ async fn process_outbound_socks5_ws_request(
     Ok(())
 }
 
-async fn handle_outbound_socks5_client_with_failover_tcp(
+async fn handle_shadowsocks_ws_client_inner(
+    peer: ws_mux::MuxWsPeer,
+    remote_raw_definition: ServiceDefinition,
+    remote_peer_id: Option<String>,
+    client: &mut TcpStream,
+    stream_id: u32,
+    registry: Arc<Mutex<AgentRegistry>>,
+    request: ShadowsocksRequest,
+) -> Result<(), Error> {
+    let mut rx = peer.open_stream_receiver(stream_id).await;
+    let open_message = build_remote_stream_open_for_target(
+        &remote_raw_definition,
+        &request.target_host,
+        request.target_port,
+    )?;
+    registry.lock().await.open_stream(
+        stream_id,
+        peer.session.remote.agent_id.clone(),
+        open_message.service.clone(),
+        build_stream_target_label(&open_message.target_host, open_message.target_port),
+    );
+    let open = Frame::new(
+        MessageType::StreamOpen,
+        Some(peer.session.local.agent_id.clone()),
+        Some(
+            remote_peer_id
+                .clone()
+                .unwrap_or_else(|| peer.session.remote.agent_id.clone()),
+        ),
+        Message::StreamOpen(open_message),
+    )
+    .with_stream_id(stream_id);
+    peer.send_frame(&open).await?;
+    registry.lock().await.mark_stream_active(stream_id);
+
+    if !request.initial_payload.is_empty() {
+        send_stream_data_ws(&peer, stream_id, &request.initial_payload).await?;
+        let _ = write_next_stream_data_to_client(&mut rx, client, stream_id, "ss").await?;
+    }
+
+    loop {
+        let mut buf = [0_u8; 4096];
+        let n = client.read(&mut buf).await?;
+        if n == 0 {
+            registry.lock().await.mark_stream_closing(stream_id);
+            break;
+        }
+
+        send_stream_data_ws(&peer, stream_id, &buf[..n]).await?;
+        if !write_next_stream_data_to_client(&mut rx, client, stream_id, "ss").await? {
+            registry.lock().await.mark_stream_closing(stream_id);
+            break;
+        }
+    }
+
+    let close = build_stream_close_frame(
+        &peer.session.local.agent_id,
+        &peer.session.remote.agent_id,
+        stream_id,
+    );
+    peer.send_frame(&close).await?;
+    expect_stream_close_ack(&mut rx, stream_id).await?;
+    registry.lock().await.mark_stream_closed(stream_id);
+    Ok(())
+}
+
+async fn send_stream_data_tcp(
+    peer: &tcp_mux::MuxTcpPeer,
+    stream_id: u32,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let payload = build_stream_data_frame(
+        &peer.session.local.agent_id,
+        &peer.session.remote.agent_id,
+        stream_id,
+        bytes,
+    );
+    peer.send_frame(&payload).await
+}
+
+async fn send_stream_data_ws(
+    peer: &ws_mux::MuxWsPeer,
+    stream_id: u32,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let payload = build_stream_data_frame(
+        &peer.session.local.agent_id,
+        &peer.session.remote.agent_id,
+        stream_id,
+        bytes,
+    );
+    peer.send_frame(&payload).await
+}
+
+async fn connect_selected_shadowsocks_peer_tcp(
+    upstream_pool: TcpMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: &[TunnelEndpoint],
+    conn_policy: &ConnPolicy,
+    proxy_chain: &[String],
+    hub: &Arc<Mutex<SessionHub>>,
+    registry: &Arc<Mutex<AgentRegistry>>,
+) -> Result<(String, tcp_mux::MuxTcpPeer), Error> {
+    upstream_pool
+        .acquire(identity, endpoints, conn_policy, proxy_chain, hub, registry)
+        .await
+}
+
+async fn connect_selected_shadowsocks_peer_ws(
+    upstream_pool: WsMuxUpstreamPool,
+    identity: AgentIdentity,
+    endpoints: &[TunnelEndpoint],
+    conn_policy: &ConnPolicy,
+    hub: &Arc<Mutex<SessionHub>>,
+    registry: &Arc<Mutex<AgentRegistry>>,
+) -> Result<(String, ws_mux::MuxWsPeer), Error> {
+    upstream_pool
+        .acquire(identity, endpoints, conn_policy, hub, registry)
+        .await
+}
+
+async fn handle_outbound_shadowsocks_client_with_failover_tcp(
     upstream_pool: TcpMuxUpstreamPool,
     identity: AgentIdentity,
     endpoints: Vec<TunnelEndpoint>,
@@ -362,12 +425,11 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
-    let request = read_connect_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
-        let (key, peer) = match connect_selected_socks5_peer_tcp(
+        let (key, peer) = match connect_selected_shadowsocks_peer_tcp(
             upstream_pool.clone(),
             identity.clone(),
             &endpoints,
@@ -385,7 +447,7 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
             }
         };
         println!("upstream.pool.reuse=tcp endpoint={key}");
-        match process_outbound_socks5_tcp_request(
+        match handle_shadowsocks_client_inner(
             peer,
             remote_raw_definition.clone(),
             remote_peer_id.clone(),
@@ -403,10 +465,10 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| Error::other("no socks5 tcp upstream succeeded")))
+    Err(last_err.unwrap_or_else(|| Error::other("no shadowsocks tcp upstream succeeded")))
 }
 
-async fn handle_outbound_socks5_client_with_failover_ws(
+async fn handle_outbound_shadowsocks_client_with_failover_ws(
     upstream_pool: WsMuxUpstreamPool,
     identity: AgentIdentity,
     endpoints: Vec<TunnelEndpoint>,
@@ -418,12 +480,11 @@ async fn handle_outbound_socks5_client_with_failover_ws(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
-    let request = read_connect_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
-        let (key, peer) = match connect_selected_socks5_peer_ws(
+        let (key, peer) = match connect_selected_shadowsocks_peer_ws(
             upstream_pool.clone(),
             identity.clone(),
             &endpoints,
@@ -440,7 +501,7 @@ async fn handle_outbound_socks5_client_with_failover_ws(
             }
         };
         println!("upstream.pool.reuse=ws endpoint={key}");
-        match process_outbound_socks5_ws_request(
+        match handle_shadowsocks_ws_client_inner(
             peer,
             remote_raw_definition.clone(),
             remote_peer_id.clone(),
@@ -458,7 +519,7 @@ async fn handle_outbound_socks5_client_with_failover_ws(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| Error::other("no socks5 ws upstream succeeded")))
+    Err(last_err.unwrap_or_else(|| Error::other("no shadowsocks ws upstream succeeded")))
 }
 
 fn spawn_tcp_upstream_pool_maintenance(

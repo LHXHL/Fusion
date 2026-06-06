@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod crypto;
+pub mod ffi;
 pub mod protocol;
 pub mod serve;
 pub mod session;

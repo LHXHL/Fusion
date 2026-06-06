@@ -642,4 +642,73 @@ mod tests {
         let _ = fs::remove_file(cert_path);
         let _ = fs::remove_file(key_path);
     }
+
+    #[tokio::test]
+    async fn wss_mux_handshake_and_stream_roundtrip_with_mutual_tls() {
+        let listener = bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_cert_path, server_key_path) = write_self_signed_cert();
+        let (client_cert_path, client_key_path) = write_self_signed_cert();
+        let acceptor = build_ws_tls_acceptor(
+            &ParsedUrl::parse(&format!(
+                "wss://127.0.0.1:{}/tunnel?tls-cert={}&tls-key={}&tls-client-ca={}",
+                addr.port(),
+                server_cert_path.display(),
+                server_key_path.display(),
+                client_cert_path.display(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("wss-mtls-server".into()),
+            key: Some("shared-secret".into()),
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("wss-mtls-client".into()),
+            key: Some("shared-secret".into()),
+        });
+
+        let server_task = tokio::spawn(async move {
+            let peer = accept_mux_peer(server_identity, listener, acceptor)
+                .await
+                .unwrap();
+            let mut rx = peer.open_stream_receiver(77).await;
+            rx.recv().await.unwrap()
+        });
+
+        let peer = connect_mux_peer(
+            client_identity,
+            &format!(
+                "wss://localhost:{}/tunnel?tls-ca={}&tls-client-cert={}&tls-client-key={}",
+                addr.port(),
+                server_cert_path.display(),
+                client_cert_path.display(),
+                client_key_path.display(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let data = Frame::new(
+            MessageType::StreamData,
+            Some(peer.session.local.agent_id.clone()),
+            Some(peer.session.remote.agent_id.clone()),
+            Message::StreamData(StreamDataMessage::from_bytes(b"mutual")),
+        )
+        .with_stream_id(77);
+        peer.send_frame(&data).await.unwrap();
+
+        let frame = server_task.await.unwrap();
+        match frame.message {
+            Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"mutual"),
+            _ => panic!(),
+        }
+
+        let _ = fs::remove_file(server_cert_path);
+        let _ = fs::remove_file(server_key_path);
+        let _ = fs::remove_file(client_cert_path);
+        let _ = fs::remove_file(client_key_path);
+    }
 }
