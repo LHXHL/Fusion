@@ -7,7 +7,9 @@ pub enum DialTarget {
     Tcp { addr: String },
     Ws { url: String },
     Udp { addr: String },
+    SimplexDns { url: String },
     SimplexHttp { url: String },
+    SimplexOss { url: String },
     Icmp { addr: String },
     Wg { addr: String },
     Unix { path: String },
@@ -41,7 +43,13 @@ pub fn classify_endpoint(endpoint: &TunnelEndpoint) -> Result<DialTarget, Error>
                 addr: format!("{host}:{port}"),
             })
         }
+        "simplex+dns" => Ok(DialTarget::SimplexDns {
+            url: endpoint.url.original.clone(),
+        }),
         "simplex+http" => Ok(DialTarget::SimplexHttp {
+            url: endpoint.url.original.clone(),
+        }),
+        "simplex+oss" => Ok(DialTarget::SimplexOss {
             url: endpoint.url.original.clone(),
         }),
         "icmp" => {
@@ -132,8 +140,14 @@ mod tests {
         let memory = TunnelEndpoint {
             url: ParsedUrl::parse("memory://mesh-a").unwrap(),
         };
+        let simplex_dns = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+dns://127.0.0.1:5353/tunnel.local").unwrap(),
+        };
         let simplex_http = TunnelEndpoint {
             url: ParsedUrl::parse("simplex+http://127.0.0.1:7777/tunnel").unwrap(),
+        };
+        let simplex_oss = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+oss://mesh-a/tunnel").unwrap(),
         };
         let icmp = TunnelEndpoint {
             url: ParsedUrl::parse("icmp://127.0.0.1:4444").unwrap(),
@@ -148,9 +162,21 @@ mod tests {
             }
         );
         assert_eq!(
+            classify_endpoint(&simplex_dns).unwrap(),
+            DialTarget::SimplexDns {
+                url: "simplex+dns://127.0.0.1:5353/tunnel.local".to_string()
+            }
+        );
+        assert_eq!(
             classify_endpoint(&simplex_http).unwrap(),
             DialTarget::SimplexHttp {
                 url: "simplex+http://127.0.0.1:7777/tunnel".to_string()
+            }
+        );
+        assert_eq!(
+            classify_endpoint(&simplex_oss).unwrap(),
+            DialTarget::SimplexOss {
+                url: "simplex+oss://mesh-a/tunnel".to_string()
             }
         );
         assert_eq!(

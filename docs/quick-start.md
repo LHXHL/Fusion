@@ -174,3 +174,35 @@ cargo run --bin fusion -- \
 - `--wrap-compress`：启用 transport payload 压缩
 - `--wrap-padding <BYTES>`：增加固定额外 padding
 - 当前要求通信双方配置一致
+
+## 15. 本地代理认证
+
+```bash
+cargo run --bin fusion -- \
+  -c tcp://127.0.0.1:34996 \
+  -l "socks5://127.0.0.1:1080?username=demo&password=secret" \
+  -l "http://127.0.0.1:8080?username=demo&password=secret" \
+  -r raw://
+```
+
+说明：
+- `socks5://...?username=...&password=...`：启用 SOCKS5 用户名密码认证
+- `http://...?username=...&password=...`：启用 HTTP Basic 代理认证
+- 未配置 `username/password` 时，行为保持为无认证入口
+
+## 16. simplex+http task
+
+```bash
+cargo run --bin fusion -- \
+  -s simplex+http://0.0.0.0:39090/task \
+  -a simplex-server
+
+cargo run --bin fusion -- \
+  -c simplex+http://127.0.0.1:39090/task \
+  --task-peer <PEER_ID> \
+  task shell "whoami"
+```
+
+说明：
+- `simplex+http://` 当前已可承载 direct task 请求
+- 当前仍未接入 mux / relay / `simplex+dns://` / `simplex+oss://`

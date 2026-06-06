@@ -100,5 +100,8 @@
 | 单一二进制 | `src/bin/fusion.rs` | 已覆盖 |
 | C ABI 基础导出 | `src/ffi.rs` 测试 + `cargo build --lib` | 已覆盖 |
 | simplex / SR-ARQ 基础层 | `src/tunnel/simplex.rs` + `src/tunnel/simplex_http.rs`（握手 / 分片 / ACK重传 / 窗口发送 / batch send-receive / dedup / frame exchange）测试 | 已覆盖 |
+| simplex+http direct task | `outbound_task_over_simplex_http_endpoint_succeeds` | 已覆盖 |
+| 认证代理链 | `connects_via_authenticated_http_and_socks5_proxy_chain` | 已覆盖 |
+| task 多端点 failover | `outbound_task_fails_over_to_second_tcp_endpoint` | 已覆盖 |
 | wrapper pipeline 多 stage 基础层 | `src/crypto/wrapper.rs` / `src/crypto/transport.rs`（compression / padding / AEAD 组合）测试 | 已覆盖 |
 | 文档面向单体 Agent | README + docs | 已覆盖 |

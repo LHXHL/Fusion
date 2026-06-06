@@ -1,8 +1,18 @@
+# Fusion example config
+#
+# Notes:
+# - CLI flags override values from this file
+# - Empty arrays mean "disabled"
+# - Keep both sides aligned when using wrapper or shared-key options
+
 listens = ["tcp://0.0.0.0:34996"]
 connects = []
+up_connects = []
+down_connects = []
 local_serves = []
 remote_serves = []
-remote_peer_id = ""
+proxy_chain = []
+conn_policy = "fallback"
 data_dir = ".fusion"
 log_level = "info"
 
@@ -12,3 +22,44 @@ name = "node-a"
 [retry]
 interval_secs = 10
 max_interval_secs = 300
+
+[wrapper]
+compress = false
+padding = 0
+
+# Example profiles:
+#
+# TCP listener:
+# listens = ["tcp://0.0.0.0:34996"]
+#
+# WSS listener:
+# listens = ["wss://0.0.0.0:8443/tunnel?tls-cert=/tmp/fusion-cert.pem&tls-key=/tmp/fusion-key.pem"]
+#
+# Multi-upstream:
+# connects = ["tcp://127.0.0.1:34996", "ws://127.0.0.1:38080/tunnel"]
+# conn_policy = "round-robin"
+#
+# Up/down split:
+# up_connects = ["tcp://127.0.0.1:34996"]
+# down_connects = ["ws://127.0.0.1:38080/tunnel"]
+#
+# Local entry service:
+# local_serves = ["socks5://127.0.0.1:1080", "http://127.0.0.1:8080"]
+#
+# Local entry service with auth:
+# local_serves = [
+#   "socks5://127.0.0.1:1080?username=demo&password=secret",
+#   "http://127.0.0.1:8080?username=demo&password=secret",
+# ]
+#
+# Remote egress:
+# remote_serves = ["raw://", "port://127.0.0.1:8080->example.com:80"]
+#
+# Proxy chain:
+# front_proxy = "http://127.0.0.1:8080"
+# proxy_chain = ["socks5://127.0.0.1:1080"]
+#
+# Wrapper:
+# [wrapper]
+# compress = true
+# padding = 32

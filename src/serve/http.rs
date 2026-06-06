@@ -1,5 +1,6 @@
 use std::io::{Error, ErrorKind};
 
+use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -9,6 +10,8 @@ use crate::utils::url::ParsedUrl;
 pub struct HttpProxyService {
     pub bind_host: String,
     pub bind_port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub struct HttpProxyRequest {
     pub target_port: u16,
     pub initial_payload: Vec<u8>,
     pub connect_tunnel: bool,
+    pub proxy_authorization: Option<String>,
 }
 
 impl HttpProxyService {
@@ -27,6 +31,15 @@ impl HttpProxyService {
                 format!("expected http scheme, got {}", url.scheme),
             ));
         }
+        let username = url.query.get("username").cloned();
+        let password = url.query.get("password").cloned();
+        if username.is_some() ^ password.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "http proxy auth requires both username and password",
+            ));
+        }
+
         Ok(Self {
             bind_host: url.host.clone().ok_or_else(|| {
                 Error::new(ErrorKind::InvalidInput, "http proxy bind host is missing")
@@ -34,11 +47,64 @@ impl HttpProxyService {
             bind_port: url.port.ok_or_else(|| {
                 Error::new(ErrorKind::InvalidInput, "http proxy bind port is missing")
             })?,
+            username,
+            password,
         })
     }
 
     pub fn bind_label(&self) -> String {
         format!("{}:{}", self.bind_host, self.bind_port)
+    }
+
+    pub fn summary_suffix(&self) -> String {
+        if let Some(username) = &self.username {
+            format!("?username={username}&password=<hidden>")
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn requires_auth(&self) -> bool {
+        self.username.is_some()
+    }
+
+    pub fn authorize(&self, header: Option<&str>) -> Result<(), Error> {
+        if !self.requires_auth() {
+            return Ok(());
+        }
+
+        let header = header.ok_or_else(|| {
+            Error::new(
+                ErrorKind::PermissionDenied,
+                "missing Proxy-Authorization header",
+            )
+        })?;
+        let encoded = header
+            .strip_prefix("Basic ")
+            .or_else(|| header.strip_prefix("basic "))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "unsupported proxy auth scheme, expected Basic",
+                )
+            })?;
+        let decoded = BASE64
+            .decode(encoded.as_bytes())
+            .map_err(|err| Error::new(ErrorKind::PermissionDenied, err.to_string()))?;
+        let decoded = String::from_utf8(decoded)
+            .map_err(|err| Error::new(ErrorKind::PermissionDenied, err.to_string()))?;
+        let expected = format!(
+            "{}:{}",
+            self.username.as_deref().unwrap_or_default(),
+            self.password.as_deref().unwrap_or_default()
+        );
+        if decoded != expected {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "invalid proxy username/password",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -76,6 +142,7 @@ pub fn parse_http_proxy_request(bytes: &[u8]) -> Result<HttpProxyRequest, Error>
             target_port,
             initial_payload: Vec::new(),
             connect_tunnel: true,
+            proxy_authorization: extract_proxy_authorization(lines),
         });
     }
 
@@ -98,9 +165,16 @@ pub fn parse_http_proxy_request(bytes: &[u8]) -> Result<HttpProxyRequest, Error>
         )
     })?;
 
+    let mut proxy_authorization = None;
     let mut rewritten =
         format!("{} {} {}\r\n", method, origin_form_path(&absolute), version).into_bytes();
     for header in lines.take_while(|line| !line.is_empty()) {
+        if is_proxy_authorization_header(header) {
+            proxy_authorization = header
+                .split_once(':')
+                .map(|(_, value)| value.trim().to_string());
+            continue;
+        }
         if is_hop_by_hop_header(header) {
             continue;
         }
@@ -115,6 +189,22 @@ pub fn parse_http_proxy_request(bytes: &[u8]) -> Result<HttpProxyRequest, Error>
         target_port,
         initial_payload: rewritten,
         connect_tunnel: false,
+        proxy_authorization,
+    })
+}
+
+fn extract_proxy_authorization<'a, I>(lines: I) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    lines.take_while(|line| !line.is_empty()).find_map(|header| {
+        if is_proxy_authorization_header(header) {
+            header
+                .split_once(':')
+                .map(|(_, value)| value.trim().to_string())
+        } else {
+            None
+        }
     })
 }
 
@@ -175,8 +265,19 @@ fn is_hop_by_hop_header(header: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
 }
 
+fn is_proxy_authorization_header(header: &str) -> bool {
+    header
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("proxy-authorization")
+}
+
 #[cfg(test)]
 mod tests {
+    use data_encoding::BASE64;
+
     use super::{parse_http_proxy_request, HttpProxyService};
     use crate::utils::url::ParsedUrl;
 
@@ -186,6 +287,16 @@ mod tests {
             HttpProxyService::from_url(&ParsedUrl::parse("http://127.0.0.1:8080").unwrap())
                 .unwrap();
         assert_eq!(service.bind_label(), "127.0.0.1:8080");
+        assert_eq!(service.summary_suffix(), "");
+    }
+
+    #[test]
+    fn parse_http_proxy_service_with_auth() {
+        let service = HttpProxyService::from_url(
+            &ParsedUrl::parse("http://127.0.0.1:8080?username=demo&password=secret").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(service.summary_suffix(), "?username=demo&password=<hidden>");
     }
 
     #[test]
@@ -197,6 +308,7 @@ mod tests {
         assert!(request.connect_tunnel);
         assert_eq!(request.target_host, "example.com");
         assert_eq!(request.target_port, 443);
+        assert!(request.proxy_authorization.is_none());
     }
 
     #[test]
@@ -221,6 +333,7 @@ mod tests {
         assert!(std::str::from_utf8(&request.initial_payload)
             .unwrap()
             .starts_with("GET /path?q=1 HTTP/1.1\r\n"));
+        assert!(request.proxy_authorization.is_none());
     }
 
     #[test]
@@ -241,5 +354,35 @@ mod tests {
         let payload = String::from_utf8(request.initial_payload).unwrap();
         assert!(!payload.to_ascii_lowercase().contains("proxy-connection:"));
         assert!(!payload.to_ascii_lowercase().contains("connection:"));
+    }
+
+    #[test]
+    fn parse_proxy_authorization_header_and_strip_it_from_forwarded_payload() {
+        let token = BASE64.encode(b"demo:secret");
+        let request = parse_http_proxy_request(
+            format!(
+                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {token}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            request.proxy_authorization.as_deref(),
+            Some(format!("Basic {token}").as_str())
+        );
+        let payload = String::from_utf8(request.initial_payload).unwrap();
+        assert!(!payload.to_ascii_lowercase().contains("proxy-authorization:"));
+    }
+
+    #[test]
+    fn authorize_basic_proxy_auth() {
+        let service = HttpProxyService::from_url(
+            &ParsedUrl::parse("http://127.0.0.1:8080?username=demo&password=secret").unwrap(),
+        )
+        .unwrap();
+        let token = BASE64.encode(b"demo:secret");
+        service
+            .authorize(Some(&format!("Basic {token}")))
+            .unwrap();
     }
 }

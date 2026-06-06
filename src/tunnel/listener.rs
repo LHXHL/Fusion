@@ -11,7 +11,9 @@ pub enum ListenerTransport {
     Tcp,
     Ws,
     Udp,
+    SimplexDns,
     SimplexHttp,
+    SimplexOss,
     Icmp,
     Wg,
     Unix,
@@ -23,6 +25,7 @@ pub enum BoundListenerHandle {
     Udp(UdpSocket),
     Unix(UnixListener),
     Memory(MemoryListener),
+    SimplexOss(String),
 }
 
 pub struct BoundTunnelListener {
@@ -71,6 +74,21 @@ pub async fn bind_endpoint(endpoint: &TunnelEndpoint) -> Result<BoundTunnelListe
                 ws_tls_acceptor: None,
             })
         }
+        "simplex+dns" => {
+            let socket = crate::tunnel::simplex_dns::bind(&endpoint.url.original).await?;
+            let local_addr = socket.local_addr()?;
+            let path = if endpoint.url.path.is_empty() {
+                "/fusion.local".to_string()
+            } else {
+                endpoint.url.path.clone()
+            };
+            Ok(BoundTunnelListener {
+                transport: ListenerTransport::SimplexDns,
+                handle: BoundListenerHandle::Udp(socket),
+                display_url: format!("simplex+dns://{local_addr}{path}"),
+                ws_tls_acceptor: None,
+            })
+        }
         "simplex+http" => {
             let listener = TcpListener::bind(&bind_addr).await?;
             let local_addr = listener.local_addr()?;
@@ -83,6 +101,15 @@ pub async fn bind_endpoint(endpoint: &TunnelEndpoint) -> Result<BoundTunnelListe
                 transport: ListenerTransport::SimplexHttp,
                 handle: BoundListenerHandle::Tcp(listener),
                 display_url: format!("simplex+http://{local_addr}{path}"),
+                ws_tls_acceptor: None,
+            })
+        }
+        "simplex+oss" => {
+            crate::tunnel::simplex_oss::bind(&endpoint.url.original).await?;
+            Ok(BoundTunnelListener {
+                transport: ListenerTransport::SimplexOss,
+                handle: BoundListenerHandle::SimplexOss(endpoint.url.original.clone()),
+                display_url: endpoint.url.original.clone(),
                 ws_tls_acceptor: None,
             })
         }
@@ -191,6 +218,22 @@ mod tests {
         assert!(matches!(bound.handle, BoundListenerHandle::Tcp(_)));
         assert!(bound.display_url.starts_with("simplex+http://127.0.0.1:"));
         assert!(bound.display_url.ends_with("/tunnel"));
+
+        let simplex_dns = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+dns://127.0.0.1:0/tunnel.local").unwrap(),
+        };
+        let bound = bind_endpoint(&simplex_dns).await.unwrap();
+        assert_eq!(bound.transport, ListenerTransport::SimplexDns);
+        assert!(matches!(bound.handle, BoundListenerHandle::Udp(_)));
+        assert!(bound.display_url.starts_with("simplex+dns://127.0.0.1:"));
+        assert!(bound.display_url.ends_with("/tunnel.local"));
+
+        let simplex_oss = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+oss://mesh-a/tunnel").unwrap(),
+        };
+        let bound = bind_endpoint(&simplex_oss).await.unwrap();
+        assert_eq!(bound.transport, ListenerTransport::SimplexOss);
+        assert!(matches!(bound.handle, BoundListenerHandle::SimplexOss(_)));
 
         let icmp = TunnelEndpoint {
             url: ParsedUrl::parse("icmp://127.0.0.1:0").unwrap(),

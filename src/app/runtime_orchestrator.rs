@@ -16,12 +16,20 @@ use crate::{
             decide_outbound_runtime_mode, InboundRuntimeMode, OutboundRuntimeMode,
         },
         runtime_peer::{
+            run_inbound_task_server_simplex_dns,
+            run_inbound_task_server_simplex_http, run_inbound_task_server_simplex_oss,
             run_inbound_task_server_tcp, run_inbound_task_server_ws, run_outbound_relay_peer_tcp,
-            run_outbound_relay_peer_ws, TcpRelayStreamAllocator, TcpTaskPeerMap,
-            WsRelayStreamAllocator, WsTaskPeerMap,
+            run_outbound_relay_peer_simplex_dns,
+            run_outbound_relay_peer_simplex_http, run_outbound_relay_peer_simplex_oss,
+            run_outbound_relay_peer_ws, SimplexDnsRelayStreamAllocator,
+            SimplexDnsTaskPeerMap, SimplexHttpRelayStreamAllocator, SimplexHttpTaskPeerMap,
+            SimplexOssRelayStreamAllocator, SimplexOssTaskPeerMap, TcpRelayStreamAllocator,
+            TcpTaskPeerMap, WsRelayStreamAllocator, WsTaskPeerMap,
         },
         runtime_service::{
-            run_inbound_raw_once, run_inbound_raw_ws_once, run_remote_port_forward_listener,
+            run_inbound_raw_once, run_inbound_raw_simplex_dns_once,
+            run_inbound_raw_simplex_once, run_inbound_raw_simplex_oss_once,
+            run_inbound_raw_ws_once, run_remote_port_forward_listener,
         },
         runtime_shadowsocks::{run_outbound_shadowsocks_once, run_outbound_shadowsocks_ws_once},
         runtime_socks5::{run_outbound_socks5_once, run_outbound_socks5_ws_once},
@@ -33,7 +41,7 @@ use crate::{
     tunnel::{
         dialer::{classify_endpoint, DialTarget},
         listener::{bind_endpoint, BoundListenerHandle},
-        memory, simplex_http, tcp, udp, unix, ws,
+        memory, simplex_dns, simplex_http, simplex_oss, tcp, udp, unix, ws,
     },
     utils::url::ParsedUrl,
 };
@@ -44,8 +52,14 @@ pub struct RuntimeShared {
     pub registry: Arc<Mutex<AgentRegistry>>,
     pub tcp_task_peers: TcpTaskPeerMap,
     pub ws_task_peers: WsTaskPeerMap,
+    pub simplex_dns_task_peers: SimplexDnsTaskPeerMap,
+    pub simplex_http_task_peers: SimplexHttpTaskPeerMap,
+    pub simplex_oss_task_peers: SimplexOssTaskPeerMap,
     pub tcp_relay_stream_allocator: TcpRelayStreamAllocator,
     pub ws_relay_stream_allocator: WsRelayStreamAllocator,
+    pub simplex_dns_relay_stream_allocator: SimplexDnsRelayStreamAllocator,
+    pub simplex_http_relay_stream_allocator: SimplexHttpRelayStreamAllocator,
+    pub simplex_oss_relay_stream_allocator: SimplexOssRelayStreamAllocator,
     pub relay_links: RelayLinkMap,
 }
 
@@ -55,8 +69,17 @@ impl RuntimeShared {
         let registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let tcp_task_peers: TcpTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let ws_task_peers: WsTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let simplex_dns_task_peers: SimplexDnsTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let simplex_http_task_peers: SimplexHttpTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let simplex_oss_task_peers: SimplexOssTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let tcp_relay_stream_allocator: TcpRelayStreamAllocator = Arc::new(Mutex::new(100_000));
         let ws_relay_stream_allocator: WsRelayStreamAllocator = Arc::new(Mutex::new(200_000));
+        let simplex_dns_relay_stream_allocator: SimplexDnsRelayStreamAllocator =
+            Arc::new(Mutex::new(250_000));
+        let simplex_http_relay_stream_allocator: SimplexHttpRelayStreamAllocator =
+            Arc::new(Mutex::new(300_000));
+        let simplex_oss_relay_stream_allocator: SimplexOssRelayStreamAllocator =
+            Arc::new(Mutex::new(400_000));
         let relay_links: RelayLinkMap = Arc::new(Mutex::new(HashMap::new()));
 
         registry
@@ -76,8 +99,14 @@ impl RuntimeShared {
             registry,
             tcp_task_peers,
             ws_task_peers,
+            simplex_dns_task_peers,
+            simplex_http_task_peers,
+            simplex_oss_task_peers,
             tcp_relay_stream_allocator,
             ws_relay_stream_allocator,
+            simplex_dns_relay_stream_allocator,
+            simplex_http_relay_stream_allocator,
+            simplex_oss_relay_stream_allocator,
             relay_links,
         }
     }
@@ -255,7 +284,76 @@ pub async fn spawn_inbound_tasks(
                     }
                 }));
             }
-            InboundRuntimeMode::DirectSimplexHttp => {
+            InboundRuntimeMode::RawSimplexDns => {
+                let display_url = bound.display_url.clone();
+                let path = match ParsedUrl::parse(&display_url) {
+                    Ok(parsed) => parsed.path,
+                    Err(err) => {
+                        eprintln!("session.inbound.error=invalid simplex dns listener url: {err}");
+                        continue;
+                    }
+                };
+                let BoundListenerHandle::Udp(socket) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex dns listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let raw_service = inbound_raw_service.clone().unwrap();
+                println!("listen.active={}", display_url);
+                info!("listen.active={}", display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_raw_simplex_dns_once(
+                        listener_identity,
+                        socket,
+                        &path,
+                        raw_service,
+                        shared.hub,
+                        shared.registry,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::TaskSimplexDns => {
+                let display_url = bound.display_url.clone();
+                let path = match ParsedUrl::parse(&display_url) {
+                    Ok(parsed) => parsed.path,
+                    Err(err) => {
+                        eprintln!("session.inbound.error=invalid simplex dns listener url: {err}");
+                        continue;
+                    }
+                };
+                let BoundListenerHandle::Udp(socket) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex dns listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let listener_services = exposed_service_labels.to_vec();
+                println!("listen.active={}", display_url);
+                info!("listen.active={}", display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_task_server_simplex_dns(
+                        listener_identity,
+                        socket,
+                        &path,
+                        listener_services,
+                        shared.hub,
+                        shared.registry,
+                        shared.simplex_dns_task_peers,
+                        shared.simplex_dns_relay_stream_allocator,
+                        shared.relay_links,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::RawSimplexHttp => {
                 let display_url = bound.display_url.clone();
                 let path = match ParsedUrl::parse(&display_url) {
                     Ok(parsed) => parsed.path,
@@ -270,12 +368,123 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
+                let raw_service = inbound_raw_service.clone().unwrap();
                 println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
-                    match simplex_http::run_inbound_session_once(listener_identity, listener, &path)
-                        .await
+                    if let Err(err) = run_inbound_raw_simplex_once(
+                        listener_identity,
+                        listener,
+                        &path,
+                        raw_service,
+                        shared.hub,
+                        shared.registry,
+                    )
+                    .await
                     {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::TaskSimplexHttp => {
+                let display_url = bound.display_url.clone();
+                let path = match ParsedUrl::parse(&display_url) {
+                    Ok(parsed) => parsed.path,
+                    Err(err) => {
+                        eprintln!("session.inbound.error=invalid simplex http listener url: {err}");
+                        continue;
+                    }
+                };
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex http listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let listener_services = exposed_service_labels.to_vec();
+                println!("listen.active={}", display_url);
+                info!("listen.active={}", display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_task_server_simplex_http(
+                        listener_identity,
+                        listener,
+                        &path,
+                        listener_services,
+                        shared.hub,
+                        shared.registry,
+                        shared.simplex_http_task_peers,
+                        shared.simplex_http_relay_stream_allocator,
+                        shared.relay_links,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::TaskSimplexOss => {
+                let BoundListenerHandle::SimplexOss(endpoint) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex oss listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let listener_services = exposed_service_labels.to_vec();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_task_server_simplex_oss(
+                        listener_identity,
+                        &endpoint,
+                        listener_services,
+                        shared.hub,
+                        shared.registry,
+                        shared.simplex_oss_task_peers,
+                        shared.simplex_oss_relay_stream_allocator,
+                        shared.relay_links,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::RawSimplexOss => {
+                let BoundListenerHandle::SimplexOss(endpoint) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex oss listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let raw_service = inbound_raw_service.clone().unwrap();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_raw_simplex_oss_once(
+                        listener_identity,
+                        &endpoint,
+                        raw_service,
+                        shared.hub,
+                        shared.registry,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::DirectSimplexHttp => {}
+            InboundRuntimeMode::DirectSimplexOss => {
+                let BoundListenerHandle::SimplexOss(endpoint) = bound.handle else {
+                    eprintln!("session.inbound.error=expected simplex oss listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    match simplex_oss::run_inbound_session_once(listener_identity, &endpoint).await {
                         Ok((session, _)) => {
                             shared.hub.lock().await.upsert(session.clone());
                             shared.registry.lock().await.upsert_peer(session);
@@ -563,6 +772,45 @@ pub fn spawn_outbound_tasks(
                         )
                         .await
                     }
+                    OutboundRuntimeMode::RelaySimplexDns => {
+                        run_outbound_relay_peer_simplex_dns(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            exposed_service_labels.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            shared.simplex_dns_task_peers.clone(),
+                            shared.simplex_dns_relay_stream_allocator.clone(),
+                            shared.relay_links.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::RelaySimplexHttp => {
+                        run_outbound_relay_peer_simplex_http(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            exposed_service_labels.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            shared.simplex_http_task_peers.clone(),
+                            shared.simplex_http_relay_stream_allocator.clone(),
+                            shared.relay_links.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::RelaySimplexOss => {
+                        run_outbound_relay_peer_simplex_oss(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            exposed_service_labels.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            shared.simplex_oss_task_peers.clone(),
+                            shared.simplex_oss_relay_stream_allocator.clone(),
+                            shared.relay_links.clone(),
+                        )
+                        .await
+                    }
                     OutboundRuntimeMode::Direct => {
                         run_outbound_once(
                             connect_identity.clone(),
@@ -657,6 +905,16 @@ async fn run_outbound_once(
                         session.remote.agent_id, addr
                     );
                 }
+                DialTarget::SimplexDns { url } => {
+                    let (session, _) =
+                        simplex_dns::run_outbound_session_once(identity.clone(), &url).await?;
+                    hub.lock().await.upsert(session.clone());
+                    registry.lock().await.upsert_peer(session.clone());
+                    println!(
+                        "session.outbound.peer={} to={} via=simplex-dns",
+                        session.remote.agent_id, url
+                    );
+                }
                 DialTarget::SimplexHttp { url } => {
                     let (session, _) =
                         simplex_http::run_outbound_session_once(identity.clone(), &url).await?;
@@ -664,6 +922,16 @@ async fn run_outbound_once(
                     registry.lock().await.upsert_peer(session.clone());
                     println!(
                         "session.outbound.peer={} to={} via=simplex-http",
+                        session.remote.agent_id, url
+                    );
+                }
+                DialTarget::SimplexOss { url } => {
+                    let (session, _) =
+                        simplex_oss::run_outbound_session_once(identity.clone(), &url).await?;
+                    hub.lock().await.upsert(session.clone());
+                    registry.lock().await.upsert_peer(session.clone());
+                    println!(
+                        "session.outbound.peer={} to={} via=simplex-oss",
                         session.remote.agent_id, url
                     );
                 }

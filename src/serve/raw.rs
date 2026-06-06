@@ -12,7 +12,11 @@ use crate::{
         frame::{Frame, MessageType},
         message::{Message, StreamCloseMessage, StreamDataMessage, StreamOpenMessage},
     },
-    tunnel::{tcp::ActiveTcpPeer, tcp_mux::MuxTcpPeer, ws_mux::MuxWsPeer},
+    tunnel::{
+        simplex_dns_mux::MuxSimplexDnsPeer,
+        simplex_http_mux::MuxSimplexHttpPeer, simplex_oss_mux::MuxSimplexOssPeer,
+        tcp::ActiveTcpPeer, tcp_mux::MuxTcpPeer, ws_mux::MuxWsPeer,
+    },
     utils::url::ParsedUrl,
 };
 
@@ -208,6 +212,201 @@ pub async fn proxy_mux_stream_loop(
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("unexpected message in mux raw stream loop: {:?}", other),
+                ))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn proxy_simplex_mux_stream_loop(
+    peer: MuxSimplexHttpPeer,
+    service: &RawService,
+    open: StreamOpenMessage,
+    stream_id: u32,
+    mut rx: mpsc::Receiver<Frame>,
+) -> Result<(), Error> {
+    let target = target_from_stream_open(service, &open)?;
+    let mut target_stream = target.connect().await?;
+
+    while let Some(frame) = rx.recv().await {
+        if frame.header.stream_id != Some(stream_id) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "unexpected stream id for simplex mux raw stream loop",
+            ));
+        }
+
+        match frame.message {
+            Message::StreamData(data) => {
+                let bytes = data.to_bytes()?;
+                target_stream.write_all(&bytes).await?;
+                target_stream.flush().await?;
+
+                let mut buf = vec![0_u8; 4096];
+                let n = target_stream.read(&mut buf).await?;
+                if n > 0 {
+                    let response = Frame::new(
+                        MessageType::StreamData,
+                        Some(peer.session.local.agent_id.clone()),
+                        Some(peer.session.remote.agent_id.clone()),
+                        Message::StreamData(StreamDataMessage::from_bytes(&buf[..n])),
+                    )
+                    .with_stream_id(stream_id);
+                    peer.send_frame(&response).await?;
+                }
+            }
+            Message::StreamClose(_) => {
+                let ack = Frame::new(
+                    MessageType::StreamClose,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(peer.session.remote.agent_id.clone()),
+                    Message::StreamClose(StreamCloseMessage {
+                        reason: Some("ok".to_string()),
+                    }),
+                )
+                .with_stream_id(stream_id);
+                peer.send_frame(&ack).await?;
+                break;
+            }
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unexpected message in simplex mux raw stream loop: {:?}",
+                        other
+                    ),
+                ))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn proxy_simplex_oss_mux_stream_loop(
+    peer: MuxSimplexOssPeer,
+    service: &RawService,
+    open: StreamOpenMessage,
+    stream_id: u32,
+    mut rx: mpsc::Receiver<Frame>,
+) -> Result<(), Error> {
+    let target = target_from_stream_open(service, &open)?;
+    let mut target_stream = target.connect().await?;
+
+    while let Some(frame) = rx.recv().await {
+        if frame.header.stream_id != Some(stream_id) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "unexpected stream id for simplex oss mux raw stream loop",
+            ));
+        }
+
+        match frame.message {
+            Message::StreamData(data) => {
+                let bytes = data.to_bytes()?;
+                target_stream.write_all(&bytes).await?;
+                target_stream.flush().await?;
+
+                let mut buf = vec![0_u8; 4096];
+                let n = target_stream.read(&mut buf).await?;
+                if n > 0 {
+                    let response = Frame::new(
+                        MessageType::StreamData,
+                        Some(peer.session.local.agent_id.clone()),
+                        Some(peer.session.remote.agent_id.clone()),
+                        Message::StreamData(StreamDataMessage::from_bytes(&buf[..n])),
+                    )
+                    .with_stream_id(stream_id);
+                    peer.send_frame(&response).await?;
+                }
+            }
+            Message::StreamClose(_) => {
+                let ack = Frame::new(
+                    MessageType::StreamClose,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(peer.session.remote.agent_id.clone()),
+                    Message::StreamClose(StreamCloseMessage {
+                        reason: Some("ok".to_string()),
+                    }),
+                )
+                .with_stream_id(stream_id);
+                peer.send_frame(&ack).await?;
+                break;
+            }
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unexpected message in simplex oss mux raw stream loop: {:?}",
+                        other
+                    ),
+                ))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn proxy_simplex_dns_mux_stream_loop(
+    peer: MuxSimplexDnsPeer,
+    service: &RawService,
+    open: StreamOpenMessage,
+    stream_id: u32,
+    mut rx: mpsc::Receiver<Frame>,
+) -> Result<(), Error> {
+    let target = target_from_stream_open(service, &open)?;
+    let mut target_stream = target.connect().await?;
+
+    while let Some(frame) = rx.recv().await {
+        if frame.header.stream_id != Some(stream_id) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "unexpected stream id for simplex dns mux raw stream loop",
+            ));
+        }
+
+        match frame.message {
+            Message::StreamData(data) => {
+                let bytes = data.to_bytes()?;
+                target_stream.write_all(&bytes).await?;
+                target_stream.flush().await?;
+
+                let mut buf = vec![0_u8; 4096];
+                let n = target_stream.read(&mut buf).await?;
+                if n > 0 {
+                    let response = Frame::new(
+                        MessageType::StreamData,
+                        Some(peer.session.local.agent_id.clone()),
+                        Some(peer.session.remote.agent_id.clone()),
+                        Message::StreamData(StreamDataMessage::from_bytes(&buf[..n])),
+                    )
+                    .with_stream_id(stream_id);
+                    peer.send_frame(&response).await?;
+                }
+            }
+            Message::StreamClose(_) => {
+                let ack = Frame::new(
+                    MessageType::StreamClose,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(peer.session.remote.agent_id.clone()),
+                    Message::StreamClose(StreamCloseMessage {
+                        reason: Some("ok".to_string()),
+                    }),
+                )
+                .with_stream_id(stream_id);
+                peer.send_frame(&ack).await?;
+                break;
+            }
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "unexpected message in simplex dns mux raw stream loop: {:?}",
+                        other
+                    ),
                 ))
             }
         }

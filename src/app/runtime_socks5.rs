@@ -21,7 +21,7 @@ use crate::{
     },
     serve::{
         service::{build_remote_stream_open_for_request, ServiceDefinition, ServiceKind},
-        socks5::{accept_no_auth, read_connect_request, write_success_response},
+        socks5::{accept_auth, read_connect_request, write_success_response, Socks5Service},
     },
     session::{hub::SessionHub, stream::StreamIdAllocator},
     tunnel::{tcp_mux, ws_mux},
@@ -66,6 +66,7 @@ pub async fn run_outbound_socks5_once(
         println!("service.local.client={} via=socks5", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let socks_service = socks_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -81,6 +82,7 @@ pub async fn run_outbound_socks5_once(
                 endpoints,
                 conn_policy,
                 proxy_chain,
+                socks_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -98,13 +100,14 @@ pub async fn run_outbound_socks5_once(
 
 pub async fn handle_outbound_socks5_client(
     peer: tcp_mux::MuxTcpPeer,
+    local_socks_service: Socks5Service,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
+    accept_auth(&mut client, &local_socks_service).await?;
     let request = read_connect_request(&mut client).await?;
     process_outbound_socks5_tcp_request(
         peer,
@@ -211,6 +214,7 @@ pub async fn run_outbound_socks5_ws_once(
         println!("service.local.client={} via=socks5", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let socks_service = socks_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -224,6 +228,7 @@ pub async fn run_outbound_socks5_ws_once(
                 identity,
                 endpoints,
                 conn_policy,
+                socks_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -268,13 +273,14 @@ async fn connect_selected_socks5_peer_ws(
 
 pub async fn handle_outbound_socks5_ws_client(
     peer: ws_mux::MuxWsPeer,
+    local_socks_service: Socks5Service,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
+    accept_auth(&mut client, &local_socks_service).await?;
     let request = read_connect_request(&mut client).await?;
     process_outbound_socks5_ws_request(
         peer,
@@ -355,6 +361,7 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
+    local_socks_service: Socks5Service,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -362,7 +369,7 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
+    accept_auth(&mut client, &local_socks_service).await?;
     let request = read_connect_request(&mut client).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
@@ -411,6 +418,7 @@ async fn handle_outbound_socks5_client_with_failover_ws(
     identity: AgentIdentity,
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
+    local_socks_service: Socks5Service,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -418,7 +426,7 @@ async fn handle_outbound_socks5_client_with_failover_ws(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    accept_no_auth(&mut client).await?;
+    accept_auth(&mut client, &local_socks_service).await?;
     let request = read_connect_request(&mut client).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;

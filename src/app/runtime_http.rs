@@ -27,7 +27,7 @@ use crate::{
         message::Message,
     },
     serve::{
-        http::{parse_http_proxy_request, HttpProxyRequest},
+        http::{parse_http_proxy_request, HttpProxyRequest, HttpProxyService},
         service::{build_remote_stream_open_for_http_request, ServiceDefinition, ServiceKind},
     },
     session::{hub::SessionHub, stream::StreamIdAllocator},
@@ -67,6 +67,7 @@ pub async fn run_outbound_http_once(
         println!("service.local.client={} via=http", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let http_service = http_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -82,6 +83,7 @@ pub async fn run_outbound_http_once(
                 endpoints,
                 conn_policy,
                 proxy_chain,
+                http_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -99,6 +101,7 @@ pub async fn run_outbound_http_once(
 
 pub async fn handle_outbound_http_client(
     peer: tcp_mux::MuxTcpPeer,
+    local_http_service: HttpProxyService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -106,6 +109,7 @@ pub async fn handle_outbound_http_client(
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
     let request = read_http_proxy_request(&mut client).await?;
+    authorize_http_proxy_request(&mut client, &local_http_service, &request).await?;
     handle_http_proxy_client_inner(
         peer,
         remote_raw_definition,
@@ -150,6 +154,7 @@ pub async fn run_outbound_http_ws_once(
         println!("service.local.client={} via=http", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let http_service = http_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -163,6 +168,7 @@ pub async fn run_outbound_http_ws_once(
                 identity,
                 endpoints,
                 conn_policy,
+                http_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -180,6 +186,7 @@ pub async fn run_outbound_http_ws_once(
 
 pub async fn handle_outbound_http_ws_client(
     peer: ws_mux::MuxWsPeer,
+    local_http_service: HttpProxyService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -187,6 +194,7 @@ pub async fn handle_outbound_http_ws_client(
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
     let request = read_http_proxy_request(&mut client).await?;
+    authorize_http_proxy_request(&mut client, &local_http_service, &request).await?;
     handle_http_proxy_ws_client_inner(
         peer,
         remote_raw_definition,
@@ -216,6 +224,25 @@ async fn read_http_proxy_request(client: &mut TcpStream) -> Result<HttpProxyRequ
         }
     }
     parse_http_proxy_request(&buf)
+}
+
+async fn authorize_http_proxy_request(
+    client: &mut TcpStream,
+    service: &HttpProxyService,
+    request: &HttpProxyRequest,
+) -> Result<(), Error> {
+    if let Err(err) = service.authorize(request.proxy_authorization.as_deref()) {
+        if err.kind() == ErrorKind::PermissionDenied {
+            client
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fusion\"\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+            client.flush().await?;
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 async fn handle_http_proxy_client_inner(
@@ -413,6 +440,7 @@ async fn handle_outbound_http_client_with_failover_tcp(
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
+    local_http_service: HttpProxyService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -421,6 +449,7 @@ async fn handle_outbound_http_client_with_failover_tcp(
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
     let request = read_http_proxy_request(&mut client).await?;
+    authorize_http_proxy_request(&mut client, &local_http_service, &request).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
@@ -468,6 +497,7 @@ async fn handle_outbound_http_client_with_failover_ws(
     identity: AgentIdentity,
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
+    local_http_service: HttpProxyService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -476,6 +506,7 @@ async fn handle_outbound_http_client_with_failover_ws(
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
     let request = read_http_proxy_request(&mut client).await?;
+    authorize_http_proxy_request(&mut client, &local_http_service, &request).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {

@@ -9,6 +9,8 @@ use crate::{protocol::message::StreamOpenMessage, utils::url::ParsedUrl};
 pub struct Socks5Service {
     pub host: String,
     pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,15 +67,41 @@ impl Socks5Service {
             .port
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "socks5 service missing port"))?;
 
-        Ok(Self { host, port })
+        let username = url.query.get("username").cloned();
+        let password = url.query.get("password").cloned();
+        if username.is_some() ^ password.is_some() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "socks5 auth requires both username and password",
+            ));
+        }
+
+        Ok(Self {
+            host,
+            port,
+            username,
+            password,
+        })
     }
 
     pub fn bind_label(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    pub fn summary_suffix(&self) -> String {
+        if let Some(username) = &self.username {
+            format!("?username={username}&password=<hidden>")
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn requires_auth(&self) -> bool {
+        self.username.is_some()
+    }
 }
 
-pub async fn accept_no_auth<S>(stream: &mut S) -> Result<(), Error>
+pub async fn accept_auth<S>(stream: &mut S, service: &Socks5Service) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -89,6 +117,21 @@ where
     let mut methods = vec![0_u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
+    if service.requires_auth() {
+        if !methods.contains(&0x02) {
+            stream.write_all(&[0x05, 0xFF]).await?;
+            stream.flush().await?;
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "client does not support username/password auth method",
+            ));
+        }
+
+        stream.write_all(&[0x05, 0x02]).await?;
+        stream.flush().await?;
+        return verify_username_password_auth(stream, service).await;
+    }
+
     if !methods.contains(&0x00) {
         stream.write_all(&[0x05, 0xFF]).await?;
         stream.flush().await?;
@@ -97,8 +140,52 @@ where
             "client does not support no-auth method",
         ));
     }
-
     stream.write_all(&[0x05, 0x00]).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn verify_username_password_auth<S>(
+    stream: &mut S,
+    service: &Socks5Service,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let version = stream.read_u8().await?;
+    if version != 0x01 {
+        stream.write_all(&[0x01, 0x01]).await?;
+        stream.flush().await?;
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("unsupported socks auth version {version}"),
+        ));
+    }
+
+    let username_len = stream.read_u8().await? as usize;
+    let mut username = vec![0_u8; username_len];
+    stream.read_exact(&mut username).await?;
+    let password_len = stream.read_u8().await? as usize;
+    let mut password = vec![0_u8; password_len];
+    stream.read_exact(&mut password).await?;
+
+    let username =
+        String::from_utf8(username).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    let password =
+        String::from_utf8(password).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+
+    let expected_username = service.username.as_deref().unwrap_or_default();
+    let expected_password = service.password.as_deref().unwrap_or_default();
+    if username != expected_username || password != expected_password {
+        stream.write_all(&[0x01, 0x01]).await?;
+        stream.flush().await?;
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "invalid socks5 username/password",
+        ));
+    }
+
+    stream.write_all(&[0x01, 0x00]).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -173,7 +260,7 @@ mod tests {
 
     use crate::{
         serve::socks5::{
-            accept_no_auth, read_connect_request, write_success_response, Socks5Address,
+            accept_auth, read_connect_request, write_success_response, Socks5Address,
             Socks5Service,
         },
         utils::url::ParsedUrl,
@@ -184,14 +271,27 @@ mod tests {
         let url = ParsedUrl::parse("socks5://127.0.0.1:1080").unwrap();
         let svc = Socks5Service::from_url(&url).unwrap();
         assert_eq!(svc.bind_label(), "127.0.0.1:1080");
+        assert_eq!(svc.summary_suffix(), "");
+    }
+
+    #[test]
+    fn parse_socks5_service_with_auth() {
+        let url =
+            ParsedUrl::parse("socks5://127.0.0.1:1080?username=demo&password=secret").unwrap();
+        let svc = Socks5Service::from_url(&url).unwrap();
+        assert_eq!(svc.username.as_deref(), Some("demo"));
+        assert_eq!(svc.password.as_deref(), Some("secret"));
+        assert_eq!(svc.summary_suffix(), "?username=demo&password=<hidden>");
     }
 
     #[tokio::test]
     async fn socks5_no_auth_handshake_and_connect_request() {
         let (mut client, mut server) = duplex(128);
+        let service = Socks5Service::from_url(&ParsedUrl::parse("socks5://127.0.0.1:1080").unwrap())
+            .unwrap();
 
         let server_task = tokio::spawn(async move {
-            accept_no_auth(&mut server).await.unwrap();
+            accept_auth(&mut server, &service).await.unwrap();
             let req = read_connect_request(&mut server).await.unwrap();
             write_success_response(&mut server).await.unwrap();
             req
@@ -224,5 +324,33 @@ mod tests {
         assert_eq!(open.service, "raw");
         assert_eq!(open.target_host.as_deref(), Some("example.com"));
         assert_eq!(open.target_port, Some(80));
+    }
+
+    #[tokio::test]
+    async fn socks5_username_password_handshake() {
+        let (mut client, mut server) = duplex(128);
+        let service = Socks5Service::from_url(
+            &ParsedUrl::parse("socks5://127.0.0.1:1080?username=demo&password=secret").unwrap(),
+        )
+        .unwrap();
+
+        let server_task = tokio::spawn(async move { accept_auth(&mut server, &service).await });
+
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut method_reply = [0_u8; 2];
+        client.read_exact(&mut method_reply).await.unwrap();
+        assert_eq!(method_reply, [0x05, 0x02]);
+
+        client
+            .write_all(&[
+                0x01, 0x04, b'd', b'e', b'm', b'o', 0x06, b's', b'e', b'c', b'r', b'e', b't',
+            ])
+            .await
+            .unwrap();
+        let mut auth_reply = [0_u8; 2];
+        client.read_exact(&mut auth_reply).await.unwrap();
+        assert_eq!(auth_reply, [0x01, 0x00]);
+
+        server_task.await.unwrap().unwrap();
     }
 }

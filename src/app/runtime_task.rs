@@ -11,6 +11,8 @@ use crate::{
         conn_hub::order_endpoints,
         runtime_relay::{
             handle_registry_control_message, send_direct_announce_tcp_mux,
+            send_direct_announce_simplex_dns, send_direct_announce_simplex_http,
+            send_direct_announce_simplex_oss,
             send_direct_announce_ws_mux,
         },
     },
@@ -19,7 +21,7 @@ use crate::{
         message::{Message, TaskAction, TaskRequestMessage, TaskResultMessage},
     },
     session::hub::SessionHub,
-    tunnel::{tcp_mux, ws_mux},
+    tunnel::{simplex_dns, simplex_http, simplex_oss, tcp_mux, ws_mux},
 };
 use chrono::Utc;
 use tokio::sync::Mutex;
@@ -87,8 +89,8 @@ pub async fn run_outbound_task_once(
     let ordered = order_endpoints(endpoints, &conn_policy)?;
     let mut last_err = None;
     for endpoint in ordered {
-        let result = match endpoint.url.scheme.as_str() {
-            "tcp" => {
+        let result: Result<(), Error> = match endpoint.url.scheme.as_str() {
+            "tcp" => async {
                 let connect_host = endpoint.url.host.clone().ok_or_else(|| {
                     Error::new(ErrorKind::InvalidInput, "missing host for tcp connect")
                 })?;
@@ -155,7 +157,8 @@ pub async fn run_outbound_task_once(
                     )),
                 }
             }
-            "ws" | "wss" => {
+            .await,
+            "ws" | "wss" => async {
                 let peer =
                     ws_mux::connect_mux_peer(identity.clone(), &endpoint.url.original).await?;
                 hub.lock().await.upsert(peer.session.clone());
@@ -211,6 +214,178 @@ pub async fn run_outbound_task_once(
                     )),
                 }
             }
+            .await,
+            "simplex+dns" => async {
+                let peer =
+                    simplex_dns::connect_peer(identity.clone(), &endpoint.url.original).await?;
+                hub.lock().await.upsert(peer.session.clone());
+                registry.lock().await.upsert_peer(peer.session.clone());
+                println!(
+                    "session.outbound.peer={} to={} via=simplex-dns",
+                    peer.session.remote.agent_id, endpoint.url.original
+                );
+                send_direct_announce_simplex_dns(&peer, &identity, &local_services).await?;
+
+                let frame = Frame::new(
+                    MessageType::TaskRequest,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(
+                        task_request
+                            .target_agent_id
+                            .clone()
+                            .unwrap_or_else(|| peer.session.remote.agent_id.clone()),
+                    ),
+                    Message::TaskRequest(TaskRequestMessage {
+                        task_id: format!("task-{}", Utc::now().timestamp_millis()),
+                        action: task_request.action.clone(),
+                        args: task_request.args.clone(),
+                        data_hex: task_request.data_hex.clone(),
+                    }),
+                );
+                peer.send_frame(&frame).await?;
+                let response = loop {
+                    let response = peer.read_frame().await?;
+                    if handle_registry_control_message(
+                        &mut *registry.lock().await,
+                        &identity.id,
+                        &peer.session.remote.agent_id,
+                        &response.message,
+                    ) {
+                        continue;
+                    }
+                    break response;
+                };
+                match response.message {
+                    Message::TaskResult(result) => {
+                        print_task_result_summary(&result);
+                        if let Some(path) =
+                            maybe_store_task_artifact(&data_dir, &task_request, &result).await?
+                        {
+                            println!("task.result.artifact={}", path.display());
+                        }
+                        Ok(())
+                    }
+                    other => Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("expected TaskResult, got {:?}", other),
+                    )),
+                }
+            }
+            .await,
+            "simplex+http" => async {
+                let peer =
+                    simplex_http::connect_peer(identity.clone(), &endpoint.url.original).await?;
+                hub.lock().await.upsert(peer.session.clone());
+                registry.lock().await.upsert_peer(peer.session.clone());
+                println!(
+                    "session.outbound.peer={} to={} via=simplex-http",
+                    peer.session.remote.agent_id, endpoint.url.original
+                );
+                send_direct_announce_simplex_http(&peer, &identity, &local_services).await?;
+
+                let frame = Frame::new(
+                    MessageType::TaskRequest,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(
+                        task_request
+                            .target_agent_id
+                            .clone()
+                            .unwrap_or_else(|| peer.session.remote.agent_id.clone()),
+                    ),
+                    Message::TaskRequest(TaskRequestMessage {
+                        task_id: format!("task-{}", Utc::now().timestamp_millis()),
+                        action: task_request.action.clone(),
+                        args: task_request.args.clone(),
+                        data_hex: task_request.data_hex.clone(),
+                    }),
+                );
+                peer.send_frame(&frame).await?;
+                let response = loop {
+                    let response = peer.read_frame().await?;
+                    if handle_registry_control_message(
+                        &mut *registry.lock().await,
+                        &identity.id,
+                        &peer.session.remote.agent_id,
+                        &response.message,
+                    ) {
+                        continue;
+                    }
+                    break response;
+                };
+                match response.message {
+                    Message::TaskResult(result) => {
+                        print_task_result_summary(&result);
+                        if let Some(path) =
+                            maybe_store_task_artifact(&data_dir, &task_request, &result).await?
+                        {
+                            println!("task.result.artifact={}", path.display());
+                        }
+                        Ok(())
+                    }
+                    other => Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("expected TaskResult, got {:?}", other),
+                    )),
+                }
+            }
+            .await,
+            "simplex+oss" => async {
+                let peer =
+                    simplex_oss::connect_peer(identity.clone(), &endpoint.url.original).await?;
+                hub.lock().await.upsert(peer.session.clone());
+                registry.lock().await.upsert_peer(peer.session.clone());
+                println!(
+                    "session.outbound.peer={} to={} via=simplex-oss",
+                    peer.session.remote.agent_id, endpoint.url.original
+                );
+                send_direct_announce_simplex_oss(&peer, &identity, &local_services).await?;
+
+                let frame = Frame::new(
+                    MessageType::TaskRequest,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(
+                        task_request
+                            .target_agent_id
+                            .clone()
+                            .unwrap_or_else(|| peer.session.remote.agent_id.clone()),
+                    ),
+                    Message::TaskRequest(TaskRequestMessage {
+                        task_id: format!("task-{}", Utc::now().timestamp_millis()),
+                        action: task_request.action.clone(),
+                        args: task_request.args.clone(),
+                        data_hex: task_request.data_hex.clone(),
+                    }),
+                );
+                peer.send_frame(&frame).await?;
+                let response = loop {
+                    let response = peer.read_frame().await?;
+                    if handle_registry_control_message(
+                        &mut *registry.lock().await,
+                        &identity.id,
+                        &peer.session.remote.agent_id,
+                        &response.message,
+                    ) {
+                        continue;
+                    }
+                    break response;
+                };
+                match response.message {
+                    Message::TaskResult(result) => {
+                        print_task_result_summary(&result);
+                        if let Some(path) =
+                            maybe_store_task_artifact(&data_dir, &task_request, &result).await?
+                        {
+                            println!("task.result.artifact={}", path.display());
+                        }
+                        Ok(())
+                    }
+                    other => Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("expected TaskResult, got {:?}", other),
+                    )),
+                }
+            }
+            .await,
             other => Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!("task request over scheme `{}` not implemented yet", other),

@@ -17,7 +17,10 @@ use crate::{
         message::{AgentAnnounceMessage, Message},
         route::{RouteAnnouncement, RouteHop, RouteUpdateMessage},
     },
-    tunnel::{tcp_mux, ws_mux},
+    tunnel::{
+        simplex_dns, simplex_dns_mux, simplex_http, simplex_http_mux, simplex_oss,
+        simplex_oss_mux, tcp_mux, ws_mux,
+    },
 };
 
 pub const ROUTE_TTL_SECS: u64 = 300;
@@ -48,6 +51,69 @@ fn build_direct_route_update(identity: &AgentIdentity, services: &[String]) -> R
 
 pub async fn send_direct_announce_ws_mux(
     peer: &ws_mux::MuxWsPeer,
+    identity: &AgentIdentity,
+    services: &[String],
+) -> Result<(), Error> {
+    let announce = Frame::new(
+        MessageType::AgentAnnounce,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::AgentAnnounce(build_local_announce(identity, services)),
+    );
+    peer.send_frame(&announce).await?;
+    let route = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(build_direct_route_update(identity, services)),
+    );
+    peer.send_frame(&route).await
+}
+
+pub async fn send_direct_announce_simplex_http(
+    peer: &simplex_http::ActiveSimplexHttpPeer,
+    identity: &AgentIdentity,
+    services: &[String],
+) -> Result<(), Error> {
+    let announce = Frame::new(
+        MessageType::AgentAnnounce,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::AgentAnnounce(build_local_announce(identity, services)),
+    );
+    peer.send_frame(&announce).await?;
+    let route = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(build_direct_route_update(identity, services)),
+    );
+    peer.send_frame(&route).await
+}
+
+pub async fn send_direct_announce_simplex_oss(
+    peer: &simplex_oss::ActiveSimplexOssPeer,
+    identity: &AgentIdentity,
+    services: &[String],
+) -> Result<(), Error> {
+    let announce = Frame::new(
+        MessageType::AgentAnnounce,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::AgentAnnounce(build_local_announce(identity, services)),
+    );
+    peer.send_frame(&announce).await?;
+    let route = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(build_direct_route_update(identity, services)),
+    );
+    peer.send_frame(&route).await
+}
+
+pub async fn send_direct_announce_simplex_dns(
+    peer: &simplex_dns::ActiveSimplexDnsPeer,
     identity: &AgentIdentity,
     services: &[String],
 ) -> Result<(), Error> {
@@ -223,6 +289,165 @@ pub async fn send_route_snapshot_ws_mux(
         }),
     );
     peer.send_frame(&frame).await
+}
+
+pub async fn send_route_snapshot_simplex_http_mux(
+    peer: &simplex_http_mux::MuxSimplexHttpPeer,
+    identity: &AgentIdentity,
+    routes: &[RegisteredRoute],
+    exclude_destination: Option<String>,
+) -> Result<(), Error> {
+    let mut route_announcements = Vec::new();
+    for route_line in routes {
+        if exclude_destination.as_deref() == Some(route_line.destination_agent_id.as_str()) {
+            continue;
+        }
+        route_announcements.push(RouteAnnouncement {
+            origin_agent_id: route_line.destination_agent_id.clone(),
+            origin_agent_name: route_line.destination_agent_name.clone(),
+            capabilities: route_line.capabilities.clone(),
+            services: route_line.services.clone(),
+            path: prepend_route_path(identity, &route_line.path),
+        });
+    }
+    if route_announcements.is_empty() {
+        return Ok(());
+    }
+    let frame = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(RouteUpdateMessage {
+            announcements: route_announcements,
+        }),
+    );
+    peer.send_frame(&frame).await
+}
+
+pub async fn send_route_snapshot_simplex_oss_mux(
+    peer: &simplex_oss_mux::MuxSimplexOssPeer,
+    identity: &AgentIdentity,
+    routes: &[RegisteredRoute],
+    exclude_destination: Option<String>,
+) -> Result<(), Error> {
+    let mut route_announcements = Vec::new();
+    for route_line in routes {
+        if exclude_destination.as_deref() == Some(route_line.destination_agent_id.as_str()) {
+            continue;
+        }
+        route_announcements.push(RouteAnnouncement {
+            origin_agent_id: route_line.destination_agent_id.clone(),
+            origin_agent_name: route_line.destination_agent_name.clone(),
+            capabilities: route_line.capabilities.clone(),
+            services: route_line.services.clone(),
+            path: prepend_route_path(identity, &route_line.path),
+        });
+    }
+    if route_announcements.is_empty() {
+        return Ok(());
+    }
+    let frame = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(RouteUpdateMessage {
+            announcements: route_announcements,
+        }),
+    );
+    peer.send_frame(&frame).await
+}
+
+pub async fn send_route_snapshot_simplex_dns_mux(
+    peer: &simplex_dns_mux::MuxSimplexDnsPeer,
+    identity: &AgentIdentity,
+    routes: &[RegisteredRoute],
+    exclude_destination: Option<String>,
+) -> Result<(), Error> {
+    let mut route_announcements = Vec::new();
+    for route_line in routes {
+        if exclude_destination.as_deref() == Some(route_line.destination_agent_id.as_str()) {
+            continue;
+        }
+        route_announcements.push(RouteAnnouncement {
+            origin_agent_id: route_line.destination_agent_id.clone(),
+            origin_agent_name: route_line.destination_agent_name.clone(),
+            capabilities: route_line.capabilities.clone(),
+            services: route_line.services.clone(),
+            path: prepend_route_path(identity, &route_line.path),
+        });
+    }
+    if route_announcements.is_empty() {
+        return Ok(());
+    }
+    let frame = Frame::new(
+        MessageType::RouteUpdate,
+        Some(identity.id.clone()),
+        Some(peer.session.remote.agent_id.clone()),
+        Message::RouteUpdate(RouteUpdateMessage {
+            announcements: route_announcements,
+        }),
+    );
+    peer.send_frame(&frame).await
+}
+
+pub async fn broadcast_control_frame_simplex_http(
+    peer_map: &Arc<Mutex<HashMap<String, simplex_http_mux::MuxSimplexHttpPeer>>>,
+    identity: &AgentIdentity,
+    source_peer_id: &str,
+    frame: &Frame,
+) -> Result<(), Error> {
+    let forwarded = prepare_forward_frame_for_broadcast(identity, frame);
+    let peers: Vec<_> = peer_map
+        .lock()
+        .await
+        .iter()
+        .filter(|(peer_id, _)| peer_id.as_str() != source_peer_id)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    for peer in peers {
+        peer.send_frame(&forwarded).await?;
+    }
+    Ok(())
+}
+
+pub async fn broadcast_control_frame_simplex_oss(
+    peer_map: &Arc<Mutex<HashMap<String, simplex_oss_mux::MuxSimplexOssPeer>>>,
+    identity: &AgentIdentity,
+    source_peer_id: &str,
+    frame: &Frame,
+) -> Result<(), Error> {
+    let forwarded = prepare_forward_frame_for_broadcast(identity, frame);
+    let peers: Vec<_> = peer_map
+        .lock()
+        .await
+        .iter()
+        .filter(|(peer_id, _)| peer_id.as_str() != source_peer_id)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    for peer in peers {
+        peer.send_frame(&forwarded).await?;
+    }
+    Ok(())
+}
+
+pub async fn broadcast_control_frame_simplex_dns(
+    peer_map: &Arc<Mutex<HashMap<String, simplex_dns_mux::MuxSimplexDnsPeer>>>,
+    identity: &AgentIdentity,
+    source_peer_id: &str,
+    frame: &Frame,
+) -> Result<(), Error> {
+    let forwarded = prepare_forward_frame_for_broadcast(identity, frame);
+    let peers: Vec<_> = peer_map
+        .lock()
+        .await
+        .iter()
+        .filter(|(peer_id, _)| peer_id.as_str() != source_peer_id)
+        .map(|(_, peer)| peer.clone())
+        .collect();
+    for peer in peers {
+        peer.send_frame(&forwarded).await?;
+    }
+    Ok(())
 }
 
 pub async fn broadcast_control_frame_ws(
@@ -415,6 +640,57 @@ mod tests {
 async fn bridge_ws_stream_frames(
     mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
     to_peer: ws_mux::MuxWsPeer,
+    target_stream_id: u32,
+    target_dst_agent: Option<String>,
+) -> Result<(), Error> {
+    while let Some(frame) = from_rx.recv().await {
+        let forwarded = rewrite_stream_frame(&frame, target_stream_id, target_dst_agent.clone())?;
+        let should_close = matches!(forwarded.message, Message::StreamClose(_));
+        to_peer.send_frame(&forwarded).await?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn bridge_simplex_stream_frames(
+    mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
+    to_peer: simplex_http_mux::MuxSimplexHttpPeer,
+    target_stream_id: u32,
+    target_dst_agent: Option<String>,
+) -> Result<(), Error> {
+    while let Some(frame) = from_rx.recv().await {
+        let forwarded = rewrite_stream_frame(&frame, target_stream_id, target_dst_agent.clone())?;
+        let should_close = matches!(forwarded.message, Message::StreamClose(_));
+        to_peer.send_frame(&forwarded).await?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn bridge_simplex_oss_stream_frames(
+    mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
+    to_peer: simplex_oss_mux::MuxSimplexOssPeer,
+    target_stream_id: u32,
+    target_dst_agent: Option<String>,
+) -> Result<(), Error> {
+    while let Some(frame) = from_rx.recv().await {
+        let forwarded = rewrite_stream_frame(&frame, target_stream_id, target_dst_agent.clone())?;
+        let should_close = matches!(forwarded.message, Message::StreamClose(_));
+        to_peer.send_frame(&forwarded).await?;
+        if should_close {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn bridge_simplex_dns_stream_frames(
+    mut from_rx: tokio::sync::mpsc::Receiver<Frame>,
+    to_peer: simplex_dns_mux::MuxSimplexDnsPeer,
     target_stream_id: u32,
     target_dst_agent: Option<String>,
 ) -> Result<(), Error> {
@@ -650,6 +926,363 @@ pub async fn handle_ws_relay_stream_open(
         remove_relay_link(
             &relay_links_for_return,
             "ws",
+            &source_peer_id_for_return,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    eprintln!(
+        "stream.relay.open src_peer={} src_stream={} next_hop={} relay_stream={} dst={}",
+        source_peer.session.remote.agent_id,
+        source_stream_id,
+        next_hop.session.remote.agent_id,
+        target_stream_id,
+        destination_agent_id
+    );
+    Ok(())
+}
+
+pub async fn handle_simplex_relay_stream_open(
+    peer_map: Arc<Mutex<HashMap<String, simplex_http_mux::MuxSimplexHttpPeer>>>,
+    allocator: Arc<Mutex<u32>>,
+    relay_links: RelayLinkMap,
+    source_peer: simplex_http_mux::MuxSimplexHttpPeer,
+    open_frame: Frame,
+) -> Result<(), Error> {
+    let source_stream_id = open_frame.header.stream_id.ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "missing stream_id on relay StreamOpen frame",
+        )
+    })?;
+    let destination_agent_id = open_frame
+        .header
+        .dst_agent
+        .clone()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing dst_agent on StreamOpen"))?;
+    let source_agent_id = open_frame
+        .header
+        .src_agent
+        .clone()
+        .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
+
+    let next_hop =
+        { peer_map.lock().await.get(&destination_agent_id).cloned() }.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no next hop available for stream destination {destination_agent_id}"),
+            )
+        })?;
+
+    let target_stream_id = allocate_ws_relay_stream_id(&allocator).await;
+    upsert_relay_link(
+        &relay_links,
+        "simplex-http",
+        source_peer.session.remote.agent_id.clone(),
+        source_stream_id,
+        next_hop.session.remote.agent_id.clone(),
+        target_stream_id,
+        destination_agent_id.clone(),
+    )
+    .await;
+    let downstream_rx = source_peer.open_stream_receiver(source_stream_id).await;
+    let upstream_rx = next_hop.open_stream_receiver(target_stream_id).await;
+    let forwarded_open = rewrite_stream_frame(
+        &open_frame,
+        target_stream_id,
+        Some(destination_agent_id.clone()),
+    )?;
+    next_hop.send_frame(&forwarded_open).await?;
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let destination_agent_id_for_forward = destination_agent_id.clone();
+    let relay_links_for_forward = relay_links.clone();
+    let source_peer_id_for_forward = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_stream_frames(
+            downstream_rx,
+            upstream_peer.clone(),
+            target_stream_id,
+            Some(destination_agent_id_for_forward.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.forward.error={} src_peer={} stream_id={}",
+                err, downstream_peer.session.remote.agent_id, source_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_forward,
+            "simplex-http",
+            &source_peer_id_for_forward,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let source_agent_id_for_return = source_agent_id.clone();
+    let relay_links_for_return = relay_links.clone();
+    let source_peer_id_for_return = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_stream_frames(
+            upstream_rx,
+            downstream_peer.clone(),
+            source_stream_id,
+            Some(source_agent_id_for_return.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.return.error={} src_peer={} stream_id={}",
+                err, upstream_peer.session.remote.agent_id, target_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_return,
+            "simplex-http",
+            &source_peer_id_for_return,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    eprintln!(
+        "stream.relay.open src_peer={} src_stream={} next_hop={} relay_stream={} dst={}",
+        source_peer.session.remote.agent_id,
+        source_stream_id,
+        next_hop.session.remote.agent_id,
+        target_stream_id,
+        destination_agent_id
+    );
+    Ok(())
+}
+
+pub async fn handle_simplex_oss_relay_stream_open(
+    peer_map: Arc<Mutex<HashMap<String, simplex_oss_mux::MuxSimplexOssPeer>>>,
+    allocator: Arc<Mutex<u32>>,
+    relay_links: RelayLinkMap,
+    source_peer: simplex_oss_mux::MuxSimplexOssPeer,
+    open_frame: Frame,
+) -> Result<(), Error> {
+    let source_stream_id = open_frame.header.stream_id.ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "missing stream_id on relay StreamOpen frame",
+        )
+    })?;
+    let destination_agent_id = open_frame
+        .header
+        .dst_agent
+        .clone()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing dst_agent on StreamOpen"))?;
+    let source_agent_id = open_frame
+        .header
+        .src_agent
+        .clone()
+        .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
+
+    let next_hop =
+        { peer_map.lock().await.get(&destination_agent_id).cloned() }.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no next hop available for stream destination {destination_agent_id}"),
+            )
+        })?;
+
+    let target_stream_id = allocate_ws_relay_stream_id(&allocator).await;
+    upsert_relay_link(
+        &relay_links,
+        "simplex-oss",
+        source_peer.session.remote.agent_id.clone(),
+        source_stream_id,
+        next_hop.session.remote.agent_id.clone(),
+        target_stream_id,
+        destination_agent_id.clone(),
+    )
+    .await;
+    let downstream_rx = source_peer.open_stream_receiver(source_stream_id).await;
+    let upstream_rx = next_hop.open_stream_receiver(target_stream_id).await;
+    let forwarded_open = rewrite_stream_frame(
+        &open_frame,
+        target_stream_id,
+        Some(destination_agent_id.clone()),
+    )?;
+    next_hop.send_frame(&forwarded_open).await?;
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let destination_agent_id_for_forward = destination_agent_id.clone();
+    let relay_links_for_forward = relay_links.clone();
+    let source_peer_id_for_forward = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_oss_stream_frames(
+            downstream_rx,
+            upstream_peer.clone(),
+            target_stream_id,
+            Some(destination_agent_id_for_forward.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.forward.error={} src_peer={} stream_id={}",
+                err, downstream_peer.session.remote.agent_id, source_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_forward,
+            "simplex-oss",
+            &source_peer_id_for_forward,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let source_agent_id_for_return = source_agent_id.clone();
+    let relay_links_for_return = relay_links.clone();
+    let source_peer_id_for_return = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_oss_stream_frames(
+            upstream_rx,
+            downstream_peer.clone(),
+            source_stream_id,
+            Some(source_agent_id_for_return.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.return.error={} src_peer={} stream_id={}",
+                err, upstream_peer.session.remote.agent_id, target_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_return,
+            "simplex-oss",
+            &source_peer_id_for_return,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    eprintln!(
+        "stream.relay.open src_peer={} src_stream={} next_hop={} relay_stream={} dst={}",
+        source_peer.session.remote.agent_id,
+        source_stream_id,
+        next_hop.session.remote.agent_id,
+        target_stream_id,
+        destination_agent_id
+    );
+    Ok(())
+}
+
+pub async fn handle_simplex_dns_relay_stream_open(
+    peer_map: Arc<Mutex<HashMap<String, simplex_dns_mux::MuxSimplexDnsPeer>>>,
+    allocator: Arc<Mutex<u32>>,
+    relay_links: RelayLinkMap,
+    source_peer: simplex_dns_mux::MuxSimplexDnsPeer,
+    open_frame: Frame,
+) -> Result<(), Error> {
+    let source_stream_id = open_frame.header.stream_id.ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "missing stream_id on relay StreamOpen frame",
+        )
+    })?;
+    let destination_agent_id = open_frame
+        .header
+        .dst_agent
+        .clone()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing dst_agent on StreamOpen"))?;
+    let source_agent_id = open_frame
+        .header
+        .src_agent
+        .clone()
+        .unwrap_or_else(|| source_peer.session.remote.agent_id.clone());
+
+    let next_hop =
+        { peer_map.lock().await.get(&destination_agent_id).cloned() }.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("no next hop available for stream destination {destination_agent_id}"),
+            )
+        })?;
+
+    let target_stream_id = allocate_ws_relay_stream_id(&allocator).await;
+    upsert_relay_link(
+        &relay_links,
+        "simplex-dns",
+        source_peer.session.remote.agent_id.clone(),
+        source_stream_id,
+        next_hop.session.remote.agent_id.clone(),
+        target_stream_id,
+        destination_agent_id.clone(),
+    )
+    .await;
+    let downstream_rx = source_peer.open_stream_receiver(source_stream_id).await;
+    let upstream_rx = next_hop.open_stream_receiver(target_stream_id).await;
+    let forwarded_open = rewrite_stream_frame(
+        &open_frame,
+        target_stream_id,
+        Some(destination_agent_id.clone()),
+    )?;
+    next_hop.send_frame(&forwarded_open).await?;
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let destination_agent_id_for_forward = destination_agent_id.clone();
+    let relay_links_for_forward = relay_links.clone();
+    let source_peer_id_for_forward = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_dns_stream_frames(
+            downstream_rx,
+            upstream_peer.clone(),
+            target_stream_id,
+            Some(destination_agent_id_for_forward.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.forward.error={} src_peer={} stream_id={}",
+                err, downstream_peer.session.remote.agent_id, source_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_forward,
+            "simplex-dns",
+            &source_peer_id_for_forward,
+            source_stream_id,
+        )
+        .await;
+    });
+
+    let downstream_peer = source_peer.clone();
+    let upstream_peer = next_hop.clone();
+    let source_agent_id_for_return = source_agent_id.clone();
+    let relay_links_for_return = relay_links.clone();
+    let source_peer_id_for_return = source_peer.session.remote.agent_id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = bridge_simplex_dns_stream_frames(
+            upstream_rx,
+            downstream_peer.clone(),
+            source_stream_id,
+            Some(source_agent_id_for_return.clone()),
+        )
+        .await
+        {
+            eprintln!(
+                "stream.relay.return.error={} src_peer={} stream_id={}",
+                err, upstream_peer.session.remote.agent_id, target_stream_id
+            );
+        }
+        remove_relay_link(
+            &relay_links_for_return,
+            "simplex-dns",
             &source_peer_id_for_return,
             source_stream_id,
         )

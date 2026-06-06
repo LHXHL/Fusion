@@ -66,9 +66,11 @@ impl ServiceDefinition {
 
     pub fn summary_line(&self) -> String {
         match &self.kind {
-            ServiceKind::LocalSocks5(svc) => format!("service.local=socks5://{}", svc.bind_label()),
+            ServiceKind::LocalSocks5(svc) => {
+                format!("service.local=socks5://{}{}", svc.bind_label(), svc.summary_suffix())
+            }
             ServiceKind::LocalHttpProxy(svc) => {
-                format!("service.local=http://{}", svc.bind_label())
+                format!("service.local=http://{}{}", svc.bind_label(), svc.summary_suffix())
             }
             ServiceKind::LocalShadowsocks(svc) => {
                 format!(
@@ -323,6 +325,7 @@ mod tests {
             target_port: 8081,
             initial_payload: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
             connect_tunnel: false,
+            proxy_authorization: None,
         };
         let open = build_remote_stream_open_for_http_request(&remote_defs[0], &req).unwrap();
         assert_eq!(open.target_host.as_deref(), Some("dynamic.example"));
