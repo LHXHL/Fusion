@@ -88,6 +88,10 @@ service.exposed_count=1
 其中：
 - `raw://HOST:PORT`：固定出口目标
 - `raw://`：动态出口目标，由上游请求决定最终连接地址
+- `socks5://` 当前支持可选本地认证：
+  - `?username=USER&password=PASS`
+- `http://` 当前支持可选本地 Basic 代理认证：
+  - `?username=USER&password=PASS`
 
 ### Task
 - shell
@@ -372,9 +376,11 @@ cargo run --bin fusion -- \
     - `--wrap-compress`
     - `--wrap-padding <BYTES>`
   - 但当前仍以基础实现/测试覆盖为主，尚未形成协商式/自动兼容式 wrapper 交付面
-- 高级网络能力（代理链 / 连接负载均衡 / 上下行分离）仍未进入当前可交付范围
-- Phase 5 当前是**第一版实现**：
+- Phase 5 当前是**可交付的第一版实现**：
   - 代理链目前已落地 TCP 基础链路与 HTTP CONNECT / SOCKS5 前置代理
+  - 代理链现已支持认证型 HTTP CONNECT / SOCKS5 前置代理：
+    - `http://HOST:PORT?username=USER&password=PASS`
+    - `socks5://HOST:PORT?username=USER&password=PASS`
   - `conn-policy` 已用于 task / direct / socks5 / http 本地入口的上游择路
   - socks5/http 本地入口当前按“每个 client 按策略选择上游，并在上游失败时切换”
   - socks5/http 本地入口现已加入 **长生命周期上游 mux 连接池**，可复用既有上游 peer
@@ -382,6 +388,9 @@ cargo run --bin fusion -- \
   - 上游池在复用前会检查 `SessionHub` / `AgentRegistry` 中的 peer 状态，避免继续复用已关闭连接
   - 上游池现已带周期性清理任务，会定期回收 hub/registry 中已经失活的 peer
   - 更深层的 route/session 感知型热切换仍可继续增强
+- `simplex+http://` 当前已不止于基础帧交换：
+  - 已可承载 direct task 请求链路
+  - mux / relay / `simplex+dns://` / `simplex+oss://` 仍待继续扩展
 - `simplex+dns://` / `simplex+oss://` 与 WASM 仍未完成
 - `src/crypto/wrapper.rs` / `src/utils/fs.rs`：本轮明确不补空壳文件
 - 当前协议错误传播未形成统一错误码体系

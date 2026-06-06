@@ -13,8 +13,15 @@ pub enum InboundRuntimeMode {
     TaskTcp,
     RawWs,
     TaskWs,
+    RawSimplexDns,
+    TaskSimplexDns,
+    RawSimplexHttp,
+    TaskSimplexHttp,
+    RawSimplexOss,
+    TaskSimplexOss,
     DirectUdp,
     DirectSimplexHttp,
+    DirectSimplexOss,
     DirectIcmp,
     DirectWg,
     DirectUnix,
@@ -32,6 +39,9 @@ pub enum OutboundRuntimeMode {
     ShadowsocksWs,
     RelayTcp,
     RelayWs,
+    RelaySimplexDns,
+    RelaySimplexHttp,
+    RelaySimplexOss,
     Direct,
 }
 
@@ -57,8 +67,14 @@ pub fn decide_inbound_runtime_mode(
         (ListenerTransport::Tcp, _, _) => InboundRuntimeMode::TaskTcp,
         (ListenerTransport::Ws, true, false) => InboundRuntimeMode::RawWs,
         (ListenerTransport::Ws, _, _) => InboundRuntimeMode::TaskWs,
+        (ListenerTransport::SimplexDns, true, false) => InboundRuntimeMode::RawSimplexDns,
+        (ListenerTransport::SimplexDns, _, _) => InboundRuntimeMode::TaskSimplexDns,
+        (ListenerTransport::SimplexHttp, true, false) => InboundRuntimeMode::RawSimplexHttp,
+        (ListenerTransport::SimplexHttp, _, _) => InboundRuntimeMode::TaskSimplexHttp,
+        (ListenerTransport::SimplexOss, true, false) => InboundRuntimeMode::RawSimplexOss,
+        (ListenerTransport::SimplexOss, _, true) => InboundRuntimeMode::TaskSimplexOss,
+        (ListenerTransport::SimplexOss, _, false) => InboundRuntimeMode::DirectSimplexOss,
         (ListenerTransport::Udp, _, _) => InboundRuntimeMode::DirectUdp,
-        (ListenerTransport::SimplexHttp, _, _) => InboundRuntimeMode::DirectSimplexHttp,
         (ListenerTransport::Icmp, _, _) => InboundRuntimeMode::DirectIcmp,
         (ListenerTransport::Wg, _, _) => InboundRuntimeMode::DirectWg,
         (ListenerTransport::Unix, _, _) => InboundRuntimeMode::DirectUnix,
@@ -81,6 +97,9 @@ pub fn decide_outbound_runtime_mode(
 
     let is_tcp = endpoint.url.scheme == "tcp";
     let is_ws = matches!(endpoint.url.scheme.as_str(), "ws" | "wss");
+    let is_simplex_dns = endpoint.url.scheme == "simplex+dns";
+    let is_simplex_http = endpoint.url.scheme == "simplex+http";
+    let is_simplex_oss = endpoint.url.scheme == "simplex+oss";
 
     if is_tcp && has_local_socks && has_remote_egress {
         return OutboundRuntimeMode::Socks5Tcp;
@@ -105,6 +124,15 @@ pub fn decide_outbound_runtime_mode(
     }
     if is_ws && has_listener {
         return OutboundRuntimeMode::RelayWs;
+    }
+    if is_simplex_dns && has_listener {
+        return OutboundRuntimeMode::RelaySimplexDns;
+    }
+    if is_simplex_http && has_listener {
+        return OutboundRuntimeMode::RelaySimplexHttp;
+    }
+    if is_simplex_oss && has_listener {
+        return OutboundRuntimeMode::RelaySimplexOss;
     }
 
     OutboundRuntimeMode::Direct
@@ -150,11 +178,59 @@ mod tests {
         );
         assert_eq!(
             decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexDns,
+                false,
+                false
+            ),
+            InboundRuntimeMode::TaskSimplexDns
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexDns,
+                true,
+                false
+            ),
+            InboundRuntimeMode::RawSimplexDns
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
                 crate::tunnel::listener::ListenerTransport::SimplexHttp,
                 false,
                 false
             ),
-            InboundRuntimeMode::DirectSimplexHttp
+            InboundRuntimeMode::TaskSimplexHttp
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexHttp,
+                true,
+                false
+            ),
+            InboundRuntimeMode::RawSimplexHttp
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexOss,
+                true,
+                false
+            ),
+            InboundRuntimeMode::RawSimplexOss
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexOss,
+                false,
+                true
+            ),
+            InboundRuntimeMode::TaskSimplexOss
+        );
+        assert_eq!(
+            decide_inbound_runtime_mode(
+                crate::tunnel::listener::ListenerTransport::SimplexOss,
+                true,
+                false
+            ),
+            InboundRuntimeMode::RawSimplexOss
         );
         assert_eq!(
             decide_inbound_runtime_mode(
@@ -184,6 +260,15 @@ mod tests {
         };
         let udp = TunnelEndpoint {
             url: ParsedUrl::parse("udp://127.0.0.1:3").unwrap(),
+        };
+        let simplex = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+http://127.0.0.1:4/tunnel").unwrap(),
+        };
+        let simplex_dns = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+dns://127.0.0.1:53/tunnel.local").unwrap(),
+        };
+        let simplex_oss = TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+oss://mesh-a/tunnel").unwrap(),
         };
         let memory = TunnelEndpoint {
             url: ParsedUrl::parse("memory://mesh-a").unwrap(),
@@ -233,6 +318,18 @@ mod tests {
         assert_eq!(
             decide_outbound_runtime_mode(&tcp, None, false, false, false, false, true),
             OutboundRuntimeMode::RelayTcp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&simplex_dns, None, false, false, false, false, true),
+            OutboundRuntimeMode::RelaySimplexDns
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&simplex, None, false, false, false, false, true),
+            OutboundRuntimeMode::RelaySimplexHttp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&simplex_oss, None, false, false, false, false, true),
+            OutboundRuntimeMode::RelaySimplexOss
         );
         assert_eq!(
             decide_outbound_runtime_mode(&udp, None, false, false, false, false, true),

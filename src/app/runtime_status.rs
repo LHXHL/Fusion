@@ -204,13 +204,15 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     .collect::<Vec<_>>()
                     .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
                     path,
                     route.services.join(","),
                     route.capabilities.join(","),
+                    route.learned_from,
+                    route.selection_reason,
                     route.learned_at_unix
                 ));
             }
@@ -268,13 +270,15 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     .collect::<Vec<_>>()
                     .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
                     path,
                     route.services.join(","),
                     route.capabilities.join(","),
+                    route.learned_from,
+                    route.selection_reason,
                     route.learned_at_unix
                 ));
             }
@@ -526,12 +530,14 @@ pub async fn print_control_snapshot(
                         .collect::<Vec<_>>()
                         .join(">");
                     println!(
-                        "peer.route={} next_hop={} hops={} path={} services={}",
+                        "peer.route={} next_hop={} hops={} path={} services={} learned_from={} selected_by={}",
                         route.destination_agent_id,
                         route.next_hop_agent_id,
                         route.hop_count,
                         path,
-                        route.services.join(",")
+                        route.services.join(","),
+                        route.learned_from,
+                        route.selection_reason
                     );
                 }
                 println!("peer.stream_count={}", streams.len());

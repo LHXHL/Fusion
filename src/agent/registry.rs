@@ -39,6 +39,10 @@ pub struct RegisteredRoute {
     pub path: Vec<RouteHop>,
     pub services: Vec<String>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub learned_from: String,
+    #[serde(default)]
+    pub selection_reason: String,
     pub learned_at_unix: u64,
 }
 
@@ -111,6 +115,8 @@ impl AgentRegistry {
             }],
             services: announce.services.clone(),
             capabilities: announce.capabilities.clone(),
+            learned_from: "direct_announce".to_string(),
+            selection_reason: "new_destination".to_string(),
             learned_at_unix: unix_now(),
         });
     }
@@ -127,6 +133,8 @@ impl AgentRegistry {
             path: announcement.path.clone(),
             services: announcement.services.clone(),
             capabilities: announcement.capabilities.clone(),
+            learned_from: "route_update".to_string(),
+            selection_reason: "new_destination".to_string(),
             learned_at_unix: unix_now(),
         });
     }
@@ -290,12 +298,14 @@ impl AgentRegistry {
                 .collect::<Vec<_>>()
                 .join(">");
             lines.push(format!(
-                "registry.route={} next_hop={} hops={} path={} services={}",
+                "registry.route={} next_hop={} hops={} path={} services={} learned_from={} selected_by={}",
                 route.destination_agent_id,
                 route.next_hop_agent_id,
                 route.hop_count,
                 path,
-                route.services.join(",")
+                route.services.join(","),
+                route.learned_from,
+                route.selection_reason
             ));
         }
 
@@ -316,7 +326,22 @@ impl AgentRegistry {
     fn upsert_route(&mut self, candidate: RegisteredRoute) {
         let destination = candidate.destination_agent_id.clone();
         match self.routes.get(&destination) {
-            Some(existing) if !should_replace_route(existing, &candidate) => {}
+            Some(existing) => {
+                let decision = choose_route_update(existing, &candidate, |peer_id| {
+                    self.is_peer_active(peer_id)
+                });
+                match decision {
+                    RouteUpdateDecision::KeepExisting => {}
+                    RouteUpdateDecision::Replace {
+                        mut candidate,
+                        selection_reason,
+                    } => {
+                        candidate.selection_reason = selection_reason.to_string();
+                        candidate.learned_at_unix = unix_now();
+                        self.routes.insert(destination, candidate);
+                    }
+                }
+            }
             _ => {
                 self.routes.insert(destination, candidate);
             }
@@ -324,14 +349,67 @@ impl AgentRegistry {
     }
 }
 
-fn should_replace_route(existing: &RegisteredRoute, candidate: &RegisteredRoute) -> bool {
+enum RouteUpdateDecision {
+    KeepExisting,
+    Replace {
+        candidate: RegisteredRoute,
+        selection_reason: &'static str,
+    },
+}
+
+fn choose_route_update<F>(
+    existing: &RegisteredRoute,
+    candidate: &RegisteredRoute,
+    is_peer_active: F,
+) -> RouteUpdateDecision
+where
+    F: Fn(&str) -> bool,
+{
     if candidate.next_hop_agent_id == existing.next_hop_agent_id {
-        return true;
+        let mut refreshed = candidate.clone();
+        refreshed.selection_reason = "same_next_hop_refresh".to_string();
+        return RouteUpdateDecision::Replace {
+            candidate: refreshed,
+            selection_reason: "same_next_hop_refresh",
+        };
     }
 
-    candidate.hop_count < existing.hop_count
-        || (candidate.hop_count == existing.hop_count
-            && candidate.next_hop_agent_id < existing.next_hop_agent_id)
+    let existing_active = is_peer_active(&existing.next_hop_agent_id);
+    let candidate_active = is_peer_active(&candidate.next_hop_agent_id);
+    if candidate_active && !existing_active {
+        let mut replacement = candidate.clone();
+        replacement.selection_reason = "prefer_active_next_hop".to_string();
+        return RouteUpdateDecision::Replace {
+            candidate: replacement,
+            selection_reason: "prefer_active_next_hop",
+        };
+    }
+    if existing_active && !candidate_active {
+        return RouteUpdateDecision::KeepExisting;
+    }
+
+    if candidate.hop_count < existing.hop_count {
+        let mut replacement = candidate.clone();
+        replacement.selection_reason = "shorter_path".to_string();
+        return RouteUpdateDecision::Replace {
+            candidate: replacement,
+            selection_reason: "shorter_path",
+        };
+    }
+    if candidate.hop_count > existing.hop_count {
+        return RouteUpdateDecision::KeepExisting;
+    }
+
+    if candidate.next_hop_agent_id < existing.next_hop_agent_id {
+        let mut replacement = candidate.clone();
+        replacement.selection_reason = "stable_tie_break".to_string();
+        return RouteUpdateDecision::Replace {
+            candidate: replacement,
+            selection_reason: "stable_tie_break",
+        };
+    }
+
+    RouteUpdateDecision::KeepExisting
 }
 
 fn unix_now() -> u64 {
@@ -471,6 +549,8 @@ mod tests {
         );
         let summary = registry.summary_lines().join("\n");
         assert!(summary.contains("registry.route=peer-c next_hop=peer-b"));
+        assert!(summary.contains("learned_from=route_update"));
+        assert!(summary.contains("selected_by=new_destination"));
         assert!(summary.contains("registry.local_service=socks5://127.0.0.1:1080"));
     }
 
@@ -605,6 +685,10 @@ mod tests {
             ],
         });
         assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+        assert_eq!(
+            registry.clone().routes.get("peer-z").unwrap().selection_reason,
+            "stable_tie_break"
+        );
 
         registry.upsert_route_announcement(&RouteAnnouncement {
             origin_agent_id: "peer-z".into(),
@@ -623,6 +707,64 @@ mod tests {
             ],
         });
         assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+    }
+
+    #[test]
+    fn registry_prefers_active_next_hop_over_inactive_shorter_peer() {
+        let local = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("registry-route-active".into()),
+            key: None,
+        });
+        let mut registry = AgentRegistry::new();
+
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+
+        let active_session = PeerSession::new(
+            &local,
+            PeerInfo {
+                agent_id: "peer-c".into(),
+                agent_name: "peer-c-name".into(),
+                capabilities: vec!["transport:tcp".into()],
+            },
+        );
+        registry.upsert_peer(active_session);
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-c"));
+        let route = registry.clone().routes.get("peer-z").unwrap().clone();
+        assert_eq!(route.selection_reason, "prefer_active_next_hop");
+        assert_eq!(route.learned_from, "route_update");
     }
 
     #[test]
