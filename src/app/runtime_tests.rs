@@ -858,12 +858,14 @@ async fn task_artifact_save_path_override_is_used() {
         data_hex: None,
         save_path: Some(path.clone()),
         target_agent_id: None,
+        local_path: None,
     };
     let result = TaskResultMessage {
         task_id: "task-custom-save".into(),
         ok: true,
         output: "hi".into(),
         data_hex: Some(HEXLOWER.encode(b"hello-artifact")),
+        stream_id: None,
     };
     let saved = maybe_store_task_artifact(&root, &req, &result)
         .await
@@ -992,6 +994,7 @@ async fn outbound_task_fails_over_to_second_tcp_endpoint() {
                         ok: true,
                         output: "failover-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 );
                 peer.send_frame(&result).await.unwrap();
@@ -1011,6 +1014,7 @@ async fn outbound_task_fails_over_to_second_tcp_endpoint() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1064,6 +1068,7 @@ async fn outbound_task_over_simplex_http_endpoint_succeeds() {
                         ok: true,
                         output: "simplex-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 );
                 peer.send_frame(&result).await.unwrap();
@@ -1083,6 +1088,7 @@ async fn outbound_task_over_simplex_http_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1136,6 +1142,7 @@ async fn outbound_task_over_http_endpoint_succeeds() {
                         ok: true,
                         output: "http-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 ))
                 .await
@@ -1156,6 +1163,7 @@ async fn outbound_task_over_http_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1209,6 +1217,7 @@ async fn outbound_task_over_streamhttp_endpoint_succeeds() {
                         ok: true,
                         output: "streamhttp-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 ))
                 .await
@@ -1229,6 +1238,7 @@ async fn outbound_task_over_streamhttp_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1284,6 +1294,7 @@ async fn outbound_task_over_dns_endpoint_succeeds() {
                         ok: true,
                         output: "dns-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 ))
                 .await
@@ -1305,6 +1316,7 @@ async fn outbound_task_over_dns_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1358,6 +1370,7 @@ async fn outbound_task_over_h2_endpoint_succeeds() {
                         ok: true,
                         output: "h2-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 ))
                 .await
@@ -1378,6 +1391,7 @@ async fn outbound_task_over_h2_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -1433,6 +1447,7 @@ async fn outbound_task_over_simplex_dns_endpoint_succeeds() {
                         ok: true,
                         output: "simplex-dns-task-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 );
                 peer.send_frame(&result).await.unwrap();
@@ -1453,6 +1468,7 @@ async fn outbound_task_over_simplex_dns_endpoint_succeeds() {
                 data_hex: None,
                 save_path: None,
                 target_agent_id: None,
+                local_path: None,
             },
             root.clone(),
             Vec::new(),
@@ -3051,6 +3067,7 @@ async fn outbound_task_over_simplex_oss_endpoint_succeeds() {
                             ok: true,
                             output: "simplex oss ok".into(),
                             data_hex: None,
+                            stream_id: None,
                         }),
                     );
                     peer.send_frame(&response).await.unwrap();
@@ -3072,6 +3089,7 @@ async fn outbound_task_over_simplex_oss_endpoint_succeeds() {
             data_hex: None,
             save_path: None,
             target_agent_id: None,
+            local_path: None,
         },
         std::env::temp_dir(),
         vec!["svc:a".into()],

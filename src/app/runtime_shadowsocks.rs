@@ -60,19 +60,13 @@ pub async fn run_outbound_shadowsocks_once(
     };
 
     let listener = TcpListener::bind(ss_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "shadowsocks");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!(
-        "service.local.active=ss://{}{}",
-        local_addr,
-        ss_service.summary_suffix()
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=ss", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let ss_service = ss_service.clone();
@@ -129,19 +123,13 @@ pub async fn run_outbound_shadowsocks_ws_once(
     };
 
     let listener = TcpListener::bind(ss_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "shadowsocks");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!(
-        "service.local.active=ss://{}{}",
-        local_addr,
-        ss_service.summary_suffix()
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=ss", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let ss_service = ss_service.clone();
@@ -461,7 +449,6 @@ async fn handle_outbound_shadowsocks_client_with_failover_tcp(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=tcp endpoint={key}");
         match handle_shadowsocks_client_inner(
             peer,
             remote_raw_definition.clone(),
@@ -516,7 +503,6 @@ async fn handle_outbound_shadowsocks_client_with_failover_ws(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=ws endpoint={key}");
         match handle_shadowsocks_ws_client_inner(
             peer,
             remote_raw_definition.clone(),

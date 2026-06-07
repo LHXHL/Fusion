@@ -12,7 +12,8 @@ Fusion 当前是一个**单体 Agent** 项目。
   - `-c`：连接上游 tunnel
   - `-l`：开放本地入口服务
   - `-r`：暴露远端出口/固定转发服务
-  - `task`：发起任务请求
+  - `task shell` / `task interactive`：远程 shell（单次 / 交互）
+  - `task upload` / `task download`：远程文件流式传输（支持多跳 relay）
   - `status / peers / routes / services`：查看本地运行态
 
 ---
@@ -106,7 +107,8 @@ Simplex 系列说明见 [`docs/simplex-transport.md`](docs/simplex-transport.md)
   - `?username=USER&password=PASS`
 
 ### Task
-- shell
+- shell（非交互，单次命令）
+- interactive shell（交互式 PTY 终端）
 - screenshot
 - upload
 - download
@@ -222,7 +224,7 @@ cargo run --bin fusion -- \
   -a relay
 ```
 
-`h2://` / `dns://` / `simplex+http://` 等多跳 relay 用法相同，仅替换 tunnel URL；见 [`docs/relay.md`](docs/relay.md)。
+`h2://` / `dns://` / `simplex+http://` 等多跳 relay 用法相同，仅替换 tunnel URL；见 [`docs/relay.md`](docs/relay.md)。`task shell`、`task upload`、`task download` 与 `task interactive` 均可经 relay 到达远端 agent（需 `--task-peer` 指定目标 agent id）。
 
 ### socks5 -> raw
 
@@ -327,7 +329,9 @@ cargo run --bin fusion -- \
 
 当前**不作为跨独立 CLI 进程的持久监听器**使用。
 
-### task shell
+### task shell（非交互）
+
+执行远程单条命令，**仅输出命令结果**（无 `task.result.*` 元数据）：
 
 ```bash
 cargo run --bin fusion -- \
@@ -336,24 +340,139 @@ cargo run --bin fusion -- \
   task shell "whoami"
 ```
 
-示例输出（节选）：
+多跳 relay 场景下，`--task-peer` 指向最终执行命令的 agent id；control 帧经 relay 转发，无需直连目标。
 
-```text
-task.result.id=task-...
-task.result.ok=true
-task.result.output=...
+### task interactive（交互式 shell）
+
+启动远程 PTY shell，本地终端进入 raw 模式，支持 `vim`、`top` 等交互程序。退出：输入 `exit` 或 Ctrl+D。
+
+**直连目标节点**（目标即 `-s` 监听端）：
+
+```bash
+# 目标
+cargo run --bin fusion -- -s tcp://0.0.0.0:34996 -k "secret"
+
+# 本机
+cargo run --bin fusion -- \
+  -c tcp://TARGET_IP:34996 -k "secret" \
+  task interactive
 ```
+
+**经 VPS relay 连内网服务器**（TaskRequest 走 control 多跳，终端 I/O 走 stream relay）：
+
+```bash
+# 内网服务器（主动连 VPS）
+cargo run --bin fusion -- \
+  -c tcp://VPS_IP:35000 -a server-leaf -k "secret"
+
+# VPS（relay）
+cargo run --bin fusion -- \
+  -s tcp://0.0.0.0:35000 \
+  -c tcp://0.0.0.0:34996 \
+  -a relay -k "secret"
+
+# 本机（连 VPS 入口，指定 leaf agent id）
+cargo run --bin fusion -- \
+  -c tcp://VPS_IP:34996 -k "secret" \
+  --task-peer <server-leaf的agent_id> \
+  task interactive
+```
+
+查看 agent id：`fusion -c tcp://VPS_IP:34996 peers list`
+
+等价 flag：
+
+```bash
+fusion -c tcp://127.0.0.1:34996 --task-interactive-shell
+fusion -c tcp://127.0.0.1:34996 --task-interactive-shell /bin/bash
+```
+
+**传输限制**：交互式 shell 需要 mux 隧道，当前支持 `tcp://`、`ws://` / `wss://`、`h2://` / `h2s://`；`simplex+http`、`dns` 等非 mux 传输暂不支持。
+
+### task upload / download（流式文件传输）
+
+上传和下载采用 **TaskRequest + StreamOpen 两阶段握手**，数据经 stream 分块传输（64 KiB/chunk），支持多跳 relay，可对任意经 VPS 连接的 leaf agent 使用。
+
+**经 VPS 下载内网文件**：
+
+```bash
+fusion -c tcp://VPS_IP:34996 -k "secret" \
+  --task-peer <leaf-agent-id> \
+  --task-save ./local.bin \
+  task download /remote/path/file.bin
+```
+
+**经 VPS 上传文件到内网**：
+
+```bash
+fusion -c tcp://VPS_IP:34996 -k "secret" \
+  --task-peer <leaf-agent-id> \
+  task upload ./local.bin /remote/path/file.bin
+```
+
+等价 flag：
+
+```bash
+fusion -c tcp://127.0.0.1:34996 --task-download /remote/file --task-save ./out.bin
+fusion -c tcp://127.0.0.1:34996 --task-upload ./local.bin:/remote/file
+```
+
+未指定 `--task-save` 时，下载文件保存到 `data/tasks/` 目录（以远端文件名命名）。传输完成后打印字节数与路径摘要。
+
+**传输限制**：与 stream relay 相同，需 mux 隧道（`tcp` / `ws` / `h2` / `dns` / `simplex+http` / `simplex+oss`）。
+
+---
+
+## 运行时输出
+
+常态运行时**默认静默**：不打印 bootstrap、listen、session 等日志行。仅以下情况向终端输出：
+
+| 场景 | 输出 |
+|------|------|
+| `task shell` | 命令 stdout/stderr |
+| `task interactive` | 远程终端内容 |
+| `task upload` / `task download` | 传输完成摘要（字节数与路径） |
+| `status` / `peers` / `routes` / `services` | 查询结果 |
+| 启动失败 | stderr 错误信息 |
+
+调试时可提高日志级别：
+
+```bash
+cargo run --bin fusion -- --log-level info -s tcp://0.0.0.0:34996
+```
+
+默认 `--log-level` 为 `warn`；亦可在 `fusion.toml` 中设置 `log_level = "info"`。
 
 ---
 
 ## 配置
 
-命令行参数优先，也支持可选 `fusion.toml`：
+**三种方式任选，可组合使用**（命令行参数优先于配置文件）：
+
+1. **纯命令行** — 无需配置文件：
+
+```bash
+cargo run --bin fusion -- \
+  -s tcp://0.0.0.0:34996 \
+  -c tcp://127.0.0.1:34996 \
+  -a my-node
+```
+
+2. **自动加载** — 当前工作目录存在 `fusion.toml` 时自动读取，不必加 `--config`：
 
 ```bash
 cp fusion.toml.example fusion.toml
+# 编辑 fusion.toml 后
+cargo run --bin fusion --
+```
+
+3. **显式指定配置文件**：
+
+```bash
 cargo run --bin fusion -- --config ./fusion.toml
 ```
+
+若既无配置文件、也无 `-s` / `-c` / `-l` / `-r` 等参数，进程会正常退出且不启动 runtime。
 
 ## Phase 5（当前已落地的第一版）
 
@@ -436,6 +555,7 @@ cargo run --bin fusion -- \
   - 上游池现已带周期性清理任务，会定期回收 hub/registry 中已经失活的 peer
   - 更深层的 route/session 感知型热切换仍可继续增强
 - Simplex 系列（`simplex+http` / `simplex+dns` / `dns` / `simplex+oss`）与 `h2://` / `h2s://` 已可承载 direct task、mux、raw service 与 relay（含 3/5/10 跳 stream bridge）；边界见 [`docs/simplex-transport.md`](docs/simplex-transport.md)、[`docs/h2-transport.md`](docs/h2-transport.md)
+- 交互式 shell（`task interactive`）经 relay 多跳时依赖 stream bridge + `shell://interactive` StreamOpen；仅 mux 传输（tcp/ws/h2）可用
 - WASM 完整 runtime 仍未完成；**W1 纯逻辑 API 已交付**（URL/config/status），见 [`docs/embedding.md`](docs/embedding.md)、[`docs/release.md`](docs/release.md)
 - 统一错误码见 [`src/error.rs`](src/error.rs)；service/task 层覆盖仍待扩展
 
@@ -447,7 +567,7 @@ cargo run --bin fusion -- \
 cargo test --lib
 ```
 
-当前 lib 回归约 **229** 项（含 h2 mux 单元与 h2 relay 单跳 / 3 / 5 / 10 跳）。索引见 [`docs/test-matrix.md`](docs/test-matrix.md)。
+当前 lib 回归约 **231** 项（含 h2 mux 单元、h2 relay 单跳 / 3 / 5 / 10 跳、交互式 shell StreamOpen 路径）。索引见 [`docs/test-matrix.md`](docs/test-matrix.md)。
 
 ---
 

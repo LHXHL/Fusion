@@ -9,8 +9,7 @@ use crate::{
     app::{
         config::TunnelEndpoint,
         runtime_relay::{
-            broadcast_control_frame_h2, handle_h2_relay_stream_open,
-            handle_registry_control_message, send_direct_announce_h2_mux,
+            broadcast_control_frame_h2, handle_registry_control_message, send_direct_announce_h2_mux,
             send_route_snapshot_h2_mux, ROUTE_TTL_SECS,
         },
         runtime_status::RelayLinkMap,
@@ -24,7 +23,7 @@ use crate::{
         hub::SessionHub,
         router::{decide_frame_route, RouteDecision},
     },
-    task::dispatcher,
+    task::{handle, interactive_shell::ShellPeer},
     tunnel::h2_mux,
 };
 use tokio::{net::TcpListener, sync::Mutex};
@@ -50,10 +49,6 @@ pub async fn run_outbound_relay_peer_h2(
         .lock()
         .await
         .insert(peer.session.remote.agent_id.clone(), peer.clone());
-    println!(
-        "session.outbound.peer={} to={} via=h2",
-        peer.session.remote.agent_id, endpoint.url.original
-    );
     send_direct_announce_h2_mux(&peer, &identity, &local_services).await?;
     let route_snapshot = {
         let mut registry_guard = registry.lock().await;
@@ -75,6 +70,7 @@ pub async fn run_outbound_relay_peer_h2(
     let stream_peer_map = peer_map.clone();
     let stream_allocator = relay_stream_allocator.clone();
     let stream_relay_links = relay_links.clone();
+    let local_agent_id = identity.id.clone();
     tokio::spawn(async move {
         loop {
             let open_frame = match stream_peer.read_stream_open_frame().await {
@@ -85,12 +81,13 @@ pub async fn run_outbound_relay_peer_h2(
                     break;
                 }
             };
-            if let Err(err) = handle_h2_relay_stream_open(
+            if let Err(err) = crate::app::runtime_stream::handle_mux_stream_open_h2(
+                &local_agent_id,
+                stream_peer.clone(),
+                open_frame,
                 stream_peer_map.clone(),
                 stream_allocator.clone(),
                 stream_relay_links.clone(),
-                stream_peer.clone(),
-                open_frame,
             )
             .await
             {
@@ -137,7 +134,12 @@ pub async fn run_outbound_relay_peer_h2(
                         .src_agent
                         .clone()
                         .unwrap_or_else(|| peer.session.remote.agent_id.clone());
-                    let result = dispatcher::dispatch(&request).await;
+                    let result = handle::handle_local_task_request(
+                    &request,
+                    &relay_stream_allocator,
+                    ShellPeer::H2(peer.clone()),
+                )
+                .await;
                     let response = Frame::new(
                         MessageType::TaskResult,
                         Some(peer.session.local.agent_id.clone()),
@@ -250,10 +252,6 @@ pub async fn handle_inbound_task_peer_h2(
         .lock()
         .await
         .insert(peer.session.remote.agent_id.clone(), peer.clone());
-    println!(
-        "session.inbound.peer={} from={} via=h2",
-        peer.session.remote.agent_id, peer.peer_addr
-    );
     send_direct_announce_h2_mux(&peer, &identity, &local_services).await?;
     let route_snapshot = {
         let mut registry_guard = registry.lock().await;
@@ -275,6 +273,7 @@ pub async fn handle_inbound_task_peer_h2(
     let stream_peer_map = peer_map.clone();
     let stream_allocator = relay_stream_allocator.clone();
     let stream_relay_links = relay_links.clone();
+    let local_agent_id = identity.id.clone();
     tokio::spawn(async move {
         loop {
             let open_frame = match stream_peer.read_stream_open_frame().await {
@@ -285,12 +284,13 @@ pub async fn handle_inbound_task_peer_h2(
                     break;
                 }
             };
-            if let Err(err) = handle_h2_relay_stream_open(
+            if let Err(err) = crate::app::runtime_stream::handle_mux_stream_open_h2(
+                &local_agent_id,
+                stream_peer.clone(),
+                open_frame,
                 stream_peer_map.clone(),
                 stream_allocator.clone(),
                 stream_relay_links.clone(),
-                stream_peer.clone(),
-                open_frame,
             )
             .await
             {
@@ -372,7 +372,12 @@ pub async fn handle_inbound_task_peer_h2(
                     .src_agent
                     .clone()
                     .unwrap_or_else(|| peer.session.remote.agent_id.clone());
-                let result = dispatcher::dispatch(&request).await;
+                let result = handle::handle_local_task_request(
+                    &request,
+                    &relay_stream_allocator,
+                    ShellPeer::H2(peer.clone()),
+                )
+                .await;
                 let response = Frame::new(
                     MessageType::TaskResult,
                     Some(peer.session.local.agent_id.clone()),

@@ -47,7 +47,7 @@ impl Capability {
     pub fn supports_task_action(&self, action: &TaskAction) -> bool {
         matches!(
             (self, action),
-            (Self::Shell, TaskAction::Shell)
+            (Self::Shell, TaskAction::Shell | TaskAction::InteractiveShell)
                 | (Self::Screenshot, TaskAction::Screenshot)
                 | (Self::FileUpload, TaskAction::FileUpload)
                 | (Self::FileDownload, TaskAction::FileDownload)

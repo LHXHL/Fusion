@@ -30,7 +30,7 @@ pub fn default_artifact_extension(task_request: &TaskRequestConfig) -> &'static 
     match task_request.action {
         TaskAction::Screenshot => "png",
         TaskAction::FileDownload => "bin",
-        TaskAction::Shell => "txt",
+        TaskAction::Shell | TaskAction::InteractiveShell => "txt",
         TaskAction::FileUpload => "txt",
     }
 }
@@ -66,12 +66,14 @@ pub async fn maybe_store_task_artifact(
     Ok(Some(path))
 }
 
-fn print_task_result_summary(result: &TaskResultMessage) {
-    println!("task.result.id={}", result.task_id);
-    println!("task.result.ok={}", result.ok);
-    println!("task.result.output={}", result.output.trim_end());
-    if let Some(data_hex) = result.data_hex.as_ref() {
-        println!("task.result.data_hex_len={}", data_hex.len());
+fn print_shell_task_output(result: &TaskResultMessage) {
+    let output = result.output.trim_end();
+    if output.is_empty() {
+        return;
+    }
+    print!("{output}");
+    if !result.output.ends_with('\n') {
+        println!();
     }
 }
 
@@ -80,10 +82,10 @@ async fn finalize_task_result(
     task_request: &TaskRequestConfig,
     result: &TaskResultMessage,
 ) -> Result<(), Error> {
-    print_task_result_summary(result);
-    if let Some(path) = maybe_store_task_artifact(data_dir, task_request, result).await? {
-        println!("task.result.artifact={}", path.display());
+    if matches!(task_request.action, TaskAction::Shell) {
+        print_shell_task_output(result);
     }
+    let _ = maybe_store_task_artifact(data_dir, task_request, result).await?;
     Ok(())
 }
 
@@ -98,6 +100,24 @@ pub async fn run_outbound_task_once_with_result(
     conn_policy: crate::app::config::ConnPolicy,
     proxy_chain: Vec<String>,
 ) -> Result<TaskResultMessage, Error> {
+    if matches!(
+        task_request.action,
+        TaskAction::FileUpload | TaskAction::FileDownload
+    ) {
+        return crate::app::runtime_file_transfer::run_outbound_file_transfer_once_with_result(
+            identity,
+            endpoints,
+            task_request,
+            _data_dir,
+            local_services,
+            hub,
+            registry,
+            conn_policy,
+            proxy_chain,
+        )
+        .await;
+    }
+
     let ordered = order_endpoints(endpoints, &conn_policy)?;
     let mut last_err = None;
     for endpoint in ordered {
@@ -119,10 +139,6 @@ pub async fn run_outbound_task_once_with_result(
                     .await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=tcp",
-                        peer.session.remote.agent_id, connect_addr
-                    );
                     send_direct_announce_tcp_mux(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -170,10 +186,6 @@ pub async fn run_outbound_task_once_with_result(
                         ws_mux::connect_mux_peer(identity.clone(), &endpoint.url.original).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=ws",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_ws_mux(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -221,10 +233,6 @@ pub async fn run_outbound_task_once_with_result(
                         simplex_dns::connect_peer(identity.clone(), &endpoint.url.original).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=simplex-dns",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_simplex_dns(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -272,10 +280,6 @@ pub async fn run_outbound_task_once_with_result(
                         .await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=simplex-http",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_simplex_http(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -323,10 +327,6 @@ pub async fn run_outbound_task_once_with_result(
                         streamhttp::connect_peer(identity.clone(), &endpoint.url.original).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=streamhttp",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_streamhttp(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -374,10 +374,6 @@ pub async fn run_outbound_task_once_with_result(
                         h2_mux::connect_mux_peer(identity.clone(), &endpoint.url.original).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=h2",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_h2_mux(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -425,10 +421,6 @@ pub async fn run_outbound_task_once_with_result(
                         simplex_oss::connect_peer(identity.clone(), &endpoint.url.original).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=simplex-oss",
-                        peer.session.remote.agent_id, endpoint.url.original
-                    );
                     send_direct_announce_simplex_oss(&peer, &identity, &local_services).await?;
 
                     let frame = Frame::new(
@@ -494,6 +486,37 @@ pub async fn run_outbound_task_once(
     conn_policy: crate::app::config::ConnPolicy,
     proxy_chain: Vec<String>,
 ) -> Result<(), Error> {
+    if task_request.action == TaskAction::InteractiveShell {
+        return crate::app::runtime_interactive_shell::run_outbound_interactive_shell_once(
+            identity,
+            endpoints,
+            task_request,
+            local_services,
+            hub,
+            registry,
+            conn_policy,
+            proxy_chain,
+        )
+        .await;
+    }
+    if matches!(
+        task_request.action,
+        TaskAction::FileUpload | TaskAction::FileDownload
+    ) {
+        return crate::app::runtime_file_transfer::run_outbound_file_transfer_once(
+            identity,
+            endpoints,
+            task_request,
+            data_dir,
+            local_services,
+            hub,
+            registry,
+            conn_policy,
+            proxy_chain,
+        )
+        .await;
+    }
+
     let result = run_outbound_task_once_with_result(
         identity,
         endpoints,
@@ -525,6 +548,7 @@ mod tests {
             data_hex: None,
             save_path: None,
             target_agent_id: None,
+            local_path: None,
         };
         assert_eq!(default_artifact_extension(&request), "png");
     }
@@ -541,12 +565,14 @@ mod tests {
             data_hex: None,
             save_path: None,
             target_agent_id: None,
+            local_path: None,
         };
         let result = TaskResultMessage {
             task_id: "task-1".into(),
             ok: true,
             output: String::new(),
             data_hex: Some(data_encoding::HEXLOWER.encode(b"hello")),
+            stream_id: None,
         };
         let path = maybe_store_task_artifact(&temp_dir, &request, &result)
             .await

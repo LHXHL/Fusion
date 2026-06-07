@@ -2,7 +2,6 @@ use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 
 use clap::{parser::ValueSource, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use data_encoding::HEXLOWER;
 
 use crate::app::config::{
     load_file_config, AgentIdentityConfig, AppConfig, ConnPolicy, ControlCommandConfig,
@@ -97,6 +96,14 @@ pub struct CliArgs {
     #[arg(long = "task-shell", value_name = "COMMAND", global = true)]
     pub task_shell: Option<String>,
 
+    #[arg(
+        long = "task-interactive-shell",
+        value_name = "SHELL",
+        global = true,
+        num_args = 0..=1
+    )]
+    pub task_interactive_shell: Option<Option<String>>,
+
     #[arg(long = "task-screenshot", global = true)]
     pub task_screenshot: bool,
 
@@ -114,7 +121,7 @@ pub struct CliArgs {
 
     #[arg(
         long = "log-level",
-        default_value = "info",
+        default_value = "warn",
         value_name = "LEVEL",
         global = true
     )]
@@ -179,6 +186,9 @@ pub struct ServicesCommand {
 pub enum TaskKind {
     Shell {
         command: String,
+    },
+    Interactive {
+        shell: Option<String>,
     },
     Screenshot,
     Download {
@@ -591,6 +601,9 @@ fn parse_task_request_from_flags(args: &CliArgs) -> Result<Option<TaskRequestCon
     if args.task_shell.is_some() {
         count += 1;
     }
+    if args.task_interactive_shell.is_some() {
+        count += 1;
+    }
     if args.task_screenshot {
         count += 1;
     }
@@ -616,6 +629,17 @@ fn parse_task_request_from_flags(args: &CliArgs) -> Result<Option<TaskRequestCon
             args: vec![command.clone()],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
+            target_agent_id: args.task_peer.clone(),
+        }));
+    }
+    if let Some(shell) = &args.task_interactive_shell {
+        return Ok(Some(TaskRequestConfig {
+            action: TaskAction::InteractiveShell,
+            args: shell.clone().map(|value| vec![value]).unwrap_or_default(),
+            data_hex: None,
+            save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         }));
     }
@@ -625,6 +649,7 @@ fn parse_task_request_from_flags(args: &CliArgs) -> Result<Option<TaskRequestCon
             args: vec![],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         }));
     }
@@ -634,6 +659,7 @@ fn parse_task_request_from_flags(args: &CliArgs) -> Result<Option<TaskRequestCon
             args: vec![path.clone()],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         }));
     }
@@ -641,12 +667,12 @@ fn parse_task_request_from_flags(args: &CliArgs) -> Result<Option<TaskRequestCon
         let (local, remote) = spec.split_once(':').ok_or_else(|| {
             Error::new(ErrorKind::InvalidInput, "task-upload expects LOCAL:REMOTE")
         })?;
-        let bytes = std::fs::read(local)?;
         return Ok(Some(TaskRequestConfig {
             action: TaskAction::FileUpload,
             args: vec![remote.to_string()],
-            data_hex: Some(HEXLOWER.encode(&bytes)),
+            data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: Some(PathBuf::from(local)),
             target_agent_id: args.task_peer.clone(),
         }));
     }
@@ -665,6 +691,15 @@ fn parse_task_request_from_command(args: &CliArgs) -> Result<Option<TaskRequestC
             args: vec![command.clone()],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
+            target_agent_id: args.task_peer.clone(),
+        },
+        TaskKind::Interactive { shell } => TaskRequestConfig {
+            action: TaskAction::InteractiveShell,
+            args: shell.clone().map(|value| vec![value]).unwrap_or_default(),
+            data_hex: None,
+            save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         },
         TaskKind::Screenshot => TaskRequestConfig {
@@ -672,6 +707,7 @@ fn parse_task_request_from_command(args: &CliArgs) -> Result<Option<TaskRequestC
             args: vec![],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         },
         TaskKind::Download { remote_path } => TaskRequestConfig {
@@ -679,6 +715,7 @@ fn parse_task_request_from_command(args: &CliArgs) -> Result<Option<TaskRequestC
             args: vec![remote_path.clone()],
             data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: None,
             target_agent_id: args.task_peer.clone(),
         },
         TaskKind::Upload {
@@ -687,8 +724,9 @@ fn parse_task_request_from_command(args: &CliArgs) -> Result<Option<TaskRequestC
         } => TaskRequestConfig {
             action: TaskAction::FileUpload,
             args: vec![remote_path.clone()],
-            data_hex: Some(HEXLOWER.encode(&std::fs::read(local_path)?)),
+            data_hex: None,
             save_path: args.task_save.clone(),
+            local_path: Some(PathBuf::from(local_path)),
             target_agent_id: args.task_peer.clone(),
         },
     };
@@ -795,6 +833,26 @@ mod tests {
             task.save_path.as_deref(),
             Some(std::path::Path::new("/tmp/task-sub.txt"))
         );
+    }
+
+    #[test]
+    fn parse_interactive_task_subcommand_into_config() {
+        let args = CliArgs::parse_from([
+            "fusion",
+            "-c",
+            "tcp://127.0.0.1:12345",
+            "task",
+            "interactive",
+            "/bin/bash",
+        ]);
+
+        let cfg = AppConfig::try_from(args).unwrap();
+        let task = cfg.task_request.unwrap();
+        assert!(matches!(
+            task.action,
+            crate::protocol::message::TaskAction::InteractiveShell
+        ));
+        assert_eq!(task.args, vec!["/bin/bash"]);
     }
 
     #[test]

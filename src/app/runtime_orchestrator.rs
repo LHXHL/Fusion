@@ -146,11 +146,6 @@ pub async fn spawn_remote_service_tasks(
     for service in remote_port_forward_services {
         let listener = service.bind_listener().await?;
         let local_addr = listener.local_addr()?;
-        println!(
-            "service.remote.active=port://{}->{}",
-            local_addr,
-            service.target_label()
-        );
         info!(
             "service.remote.active=port://{}->{}",
             local_addr,
@@ -196,7 +191,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_once(
@@ -220,7 +214,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_tcp(
@@ -247,7 +240,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_ws_once(
@@ -272,7 +264,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_ws(
@@ -300,7 +291,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_h2_once(
@@ -325,7 +315,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_h2(
@@ -352,7 +341,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     match udp::run_inbound_session_once(listener_identity, socket).await {
@@ -380,7 +368,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_simplex_dns_once(
@@ -413,7 +400,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_simplex_dns(
@@ -449,7 +435,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_simplex_once(
@@ -482,7 +467,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_simplex_http(
@@ -517,7 +501,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     match streamhttp::accept_peer_on(listener_identity, listener, &path).await {
@@ -537,7 +520,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let listener_services = exposed_service_labels.to_vec();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_task_server_simplex_oss(
@@ -564,7 +546,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let raw_service = inbound_raw_service.clone().unwrap();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     if let Err(err) = run_inbound_raw_simplex_oss_once(
@@ -588,7 +569,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     match simplex_oss::run_inbound_session_once(listener_identity, &endpoint).await
@@ -608,7 +588,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     match udp::run_inbound_session_once(listener_identity, socket).await {
@@ -627,7 +606,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     match udp::run_inbound_session_once(listener_identity, socket).await {
@@ -647,7 +625,6 @@ pub async fn spawn_inbound_tasks(
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
                 let display_url = bound.display_url.clone();
-                println!("listen.active={}", display_url);
                 info!("listen.active={}", display_url);
                 tasks.push(tokio::spawn(async move {
                     match unix::run_inbound_session_once(
@@ -672,7 +649,6 @@ pub async fn spawn_inbound_tasks(
                 };
                 let listener_identity = identity.clone();
                 let shared = shared.clone();
-                println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
                     match memory::run_inbound_session_once(listener_identity, listener).await {
@@ -1038,11 +1014,11 @@ pub fn spawn_outbound_tasks(
 pub async fn print_runtime_summary(shared: &RuntimeShared) {
     let summary = shared.hub.lock().await.summary_lines();
     for line in summary {
-        println!("{line}");
+        log::debug!("{line}");
     }
     let registry_summary = shared.registry.lock().await.summary_lines();
     for line in registry_summary {
-        println!("{line}");
+        log::debug!("{line}");
     }
 }
 
@@ -1068,120 +1044,72 @@ async fn run_outbound_once(
                     .await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=tcp",
-                        session.remote.agent_id, addr
-                    );
                 }
                 DialTarget::Ws { url } => {
                     let (session, _) =
                         ws::run_outbound_session_once(identity.clone(), &url).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=ws",
-                        session.remote.agent_id, url
-                    );
                 }
                 DialTarget::H2 { url } => {
                     let peer =
                         crate::tunnel::h2_mux::connect_mux_peer(identity.clone(), &url).await?;
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=h2",
-                        peer.session.remote.agent_id, url
-                    );
                 }
                 DialTarget::Udp { addr } => {
                     let (session, _) =
                         udp::run_outbound_session_once(identity.clone(), &addr).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=udp",
-                        session.remote.agent_id, addr
-                    );
                 }
                 DialTarget::SimplexDns { url } => {
                     let (session, _) =
                         simplex_dns::run_outbound_session_once(identity.clone(), &url).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=simplex-dns",
-                        session.remote.agent_id, url
-                    );
                 }
                 DialTarget::SimplexHttp { url } => {
                     let (session, _) =
                         simplex_http::run_outbound_session_once(identity.clone(), &url).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=http-long-poll",
-                        session.remote.agent_id, url
-                    );
                 }
                 DialTarget::StreamHttp { url } => {
                     let (session, _) =
                         streamhttp::run_outbound_session_once(identity.clone(), &url).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=streamhttp",
-                        session.remote.agent_id, url
-                    );
                 }
                 DialTarget::SimplexOss { url } => {
                     let (session, _) =
                         simplex_oss::run_outbound_session_once(identity.clone(), &url).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=simplex-oss",
-                        session.remote.agent_id, url
-                    );
                 }
                 DialTarget::Icmp { addr } => {
                     let (session, _) =
                         udp::run_outbound_session_once(identity.clone(), &addr).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=icmp",
-                        session.remote.agent_id, addr
-                    );
                 }
                 DialTarget::Wg { addr } => {
                     let (session, _) =
                         udp::run_outbound_session_once(identity.clone(), &addr).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=wg",
-                        session.remote.agent_id, addr
-                    );
                 }
                 DialTarget::Unix { path } => {
                     let (session, _) =
                         unix::run_outbound_session_once(identity.clone(), &path).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=unix",
-                        session.remote.agent_id, path
-                    );
                 }
                 DialTarget::Memory { name } => {
                     let (session, _) =
                         memory::run_outbound_session_once(identity.clone(), &name).await?;
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
-                    println!(
-                        "session.outbound.peer={} to={} via=memory",
-                        session.remote.agent_id, name
-                    );
                 }
             }
             Ok(())

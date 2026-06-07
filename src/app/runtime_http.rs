@@ -58,15 +58,13 @@ pub async fn run_outbound_http_once(
     };
 
     let listener = TcpListener::bind(http_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "http");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=http://{}", local_addr);
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=http", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let http_service = http_service.clone();
@@ -146,15 +144,13 @@ pub async fn run_outbound_http_ws_once(
     };
 
     let listener = TcpListener::bind(http_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "http");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=http://{}", local_addr);
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=http", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let http_service = http_service.clone();
@@ -473,7 +469,6 @@ async fn handle_outbound_http_client_with_failover_tcp(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=tcp endpoint={key}");
         match handle_http_proxy_client_inner(
             peer,
             remote_raw_definition.clone(),
@@ -529,7 +524,6 @@ async fn handle_outbound_http_client_with_failover_ws(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=ws endpoint={key}");
         match handle_http_proxy_ws_client_inner(
             peer,
             remote_raw_definition.clone(),

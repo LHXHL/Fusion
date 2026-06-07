@@ -82,6 +82,7 @@ struct FfiTaskRequestInput {
     args: Vec<String>,
     data_hex: Option<String>,
     save_path: Option<String>,
+    local_path: Option<String>,
     target_agent_id: Option<String>,
 }
 
@@ -89,6 +90,7 @@ fn parse_task_action(action: &str) -> Result<crate::protocol::message::TaskActio
     use crate::protocol::message::TaskAction;
     match action {
         "shell" => Ok(TaskAction::Shell),
+        "interactive-shell" | "interactive_shell" | "interactive" => Ok(TaskAction::InteractiveShell),
         "screenshot" => Ok(TaskAction::Screenshot),
         "download" | "file-download" => Ok(TaskAction::FileDownload),
         "upload" | "file-upload" => Ok(TaskAction::FileUpload),
@@ -391,6 +393,7 @@ pub unsafe extern "C" fn fusion_runtime_task_request_json(
         args: input.args,
         data_hex: input.data_hex,
         save_path: input.save_path.map(std::path::PathBuf::from),
+        local_path: input.local_path.map(std::path::PathBuf::from),
         target_agent_id: input.target_agent_id,
     };
     match runtime.tokio.block_on(execute_task_request(&config, task)) {

@@ -35,6 +35,7 @@ pub struct AgentAnnounceMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskAction {
     Shell,
+    InteractiveShell,
     Screenshot,
     FileUpload,
     FileDownload,
@@ -54,6 +55,8 @@ pub struct TaskResultMessage {
     pub ok: bool,
     pub output: String,
     pub data_hex: Option<String>,
+    #[serde(default)]
+    pub stream_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

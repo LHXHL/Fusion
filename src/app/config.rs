@@ -50,6 +50,7 @@ pub struct TaskRequestConfig {
     pub args: Vec<String>,
     pub data_hex: Option<String>,
     pub save_path: Option<PathBuf>,
+    pub local_path: Option<PathBuf>,
     pub target_agent_id: Option<String>,
 }
 
@@ -328,7 +329,7 @@ pub fn app_config_from_file(path: &std::path::Path) -> Result<AppConfig, Error> 
         control_command: None,
         config_file: Some(path_buf),
         data_dir: file.data_dir.unwrap_or_else(|| PathBuf::from(".fusion")),
-        log_level: file.log_level.unwrap_or_else(|| "info".into()),
+        log_level: file.log_level.unwrap_or_else(|| "warn".into()),
     })
 }
 

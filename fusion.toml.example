@@ -14,7 +14,7 @@ remote_serves = []
 proxy_chain = []
 conn_policy = "fallback"
 data_dir = ".fusion"
-log_level = "info"
+log_level = "warn"
 
 [identity]
 name = "node-a"

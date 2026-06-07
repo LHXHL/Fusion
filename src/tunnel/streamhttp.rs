@@ -616,6 +616,7 @@ mod tests {
                         ok: true,
                         output: "streamhttp-ok".into(),
                         data_hex: None,
+                        stream_id: None,
                     }),
                 ))
                 .await

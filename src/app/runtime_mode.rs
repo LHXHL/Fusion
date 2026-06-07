@@ -343,6 +343,7 @@ mod tests {
                     data_hex: None,
                     save_path: None,
                     target_agent_id: None,
+                    local_path: None,
                 }),
                 false,
                 false,

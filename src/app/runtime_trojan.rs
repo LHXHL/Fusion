@@ -40,7 +40,8 @@ pub(crate) enum TrojanClientStream {
     Tls(TlsStream<TcpStream>),
 }
 
-pub fn trojan_plain_client(stream: TcpStream) -> TrojanClientStream {
+#[cfg(test)]
+pub(crate) fn trojan_plain_client(stream: TcpStream) -> TrojanClientStream {
     TrojanClientStream::Plain(stream)
 }
 
@@ -92,19 +93,13 @@ pub async fn run_outbound_trojan_once(
 ) -> Result<(), Error> {
     let (trojan_service, tls_acceptor) = trojan_listener_config(&local_trojan_definition)?;
     let listener = TcpListener::bind(trojan_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "trojan");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!(
-        "service.local.active=trojan://{}{}",
-        local_addr,
-        trojan_service.summary_suffix()
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=trojan", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let trojan_service = trojan_service.clone();
@@ -160,19 +155,13 @@ pub async fn run_outbound_trojan_ws_once(
 ) -> Result<(), Error> {
     let (trojan_service, tls_acceptor) = trojan_listener_config(&local_trojan_definition)?;
     let listener = TcpListener::bind(trojan_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "trojan");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!(
-        "service.local.active=trojan://{}{}",
-        local_addr,
-        trojan_service.summary_suffix()
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=trojan", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let trojan_service = trojan_service.clone();
@@ -251,7 +240,8 @@ async fn accept_trojan_client(
     }
 }
 
-pub async fn handle_outbound_trojan_client(
+#[cfg(test)]
+pub(crate) async fn handle_outbound_trojan_client(
     peer: tcp_mux::MuxTcpPeer,
     trojan_service: TrojanService,
     remote_raw_definition: ServiceDefinition,
@@ -468,7 +458,6 @@ async fn handle_outbound_trojan_client_with_failover_tcp(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=tcp endpoint={key}");
         match handle_trojan_client_inner_tcp(
             peer,
             remote_raw_definition.clone(),
@@ -517,7 +506,6 @@ async fn handle_outbound_trojan_client_with_failover_ws(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=ws endpoint={key}");
         match handle_trojan_client_inner_ws(
             peer,
             remote_raw_definition.clone(),

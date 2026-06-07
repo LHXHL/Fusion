@@ -57,15 +57,13 @@ pub async fn run_outbound_socks5_once(
     };
 
     let listener = TcpListener::bind(socks_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "socks5");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=socks5://{}", local_addr);
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=socks5", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let socks_service = socks_service.clone();
@@ -206,15 +204,13 @@ pub async fn run_outbound_socks5_ws_once(
     };
 
     let listener = TcpListener::bind(socks_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
     let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "socks5");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
-    println!("service.local.active=socks5://{}", local_addr);
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!("service.local.client={} via=socks5", client_addr);
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let socks_service = socks_service.clone();
@@ -268,19 +264,11 @@ pub async fn run_outbound_socks5_simplex_http_once(
     };
 
     let listener = TcpListener::bind(socks_service.bind_label()).await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    println!(
-        "service.local.active=socks5://{} via=simplex-http",
-        local_addr
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!(
-            "service.local.client={} via=socks5-simplex-http",
-            client_addr
-        );
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let socks_service = socks_service.clone();
@@ -564,7 +552,6 @@ async fn handle_outbound_socks5_client_with_failover_tcp(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=tcp endpoint={key}");
         match process_outbound_socks5_tcp_request(
             peer,
             remote_raw_definition.clone(),
@@ -620,7 +607,6 @@ async fn handle_outbound_socks5_client_with_failover_ws(
                 continue;
             }
         };
-        println!("upstream.pool.reuse=ws endpoint={key}");
         match process_outbound_socks5_ws_request(
             peer,
             remote_raw_definition.clone(),
@@ -659,7 +645,7 @@ async fn handle_outbound_socks5_client_with_failover_simplex_http(
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
-        let (key, peer) = match connect_selected_socks5_peer_simplex_http(
+        let (_key, peer) = match connect_selected_socks5_peer_simplex_http(
             identity.clone(),
             &endpoints,
             &conn_policy,
@@ -674,7 +660,6 @@ async fn handle_outbound_socks5_client_with_failover_simplex_http(
                 continue;
             }
         };
-        println!("upstream.simplex-http.connect endpoint={key}");
         match process_outbound_socks5_simplex_http_request(
             peer,
             remote_raw_definition.clone(),

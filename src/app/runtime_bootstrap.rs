@@ -82,20 +82,12 @@ pub fn emit_bootstrap_summary(config: &AppConfig, identity: &AgentIdentity) -> R
         info!("{line}");
     }
     info!("agent.id={}", identity.id);
+    info!("agent.name={}", identity.name);
     info!("agent.hostname={}", identity.hostname);
+    info!("agent.os={}", identity.os);
+    info!("agent.arch={}", identity.arch);
+    info!("bootstrap.timestamp={}", Utc::now().timestamp());
     info!("bootstrap.hello={hello_json}");
-
-    println!("Fusion unified runtime bootstrap complete.");
-    for line in config.summary_lines() {
-        println!("{line}");
-    }
-    println!("agent.id={}", identity.id);
-    println!("agent.name={}", identity.name);
-    println!("agent.hostname={}", identity.hostname);
-    println!("agent.os={}", identity.os);
-    println!("agent.arch={}", identity.arch);
-    println!("bootstrap.timestamp={}", Utc::now().timestamp());
-    println!("bootstrap.hello={hello_json}");
 
     Ok(())
 }
@@ -105,10 +97,10 @@ pub fn emit_service_summary(
     remote_services: &[ServiceDefinition],
 ) {
     for svc in local_services {
-        println!("{}", svc.summary_line());
+        info!("{}", svc.summary_line());
     }
     for svc in remote_services {
-        println!("{}", svc.summary_line());
+        info!("{}", svc.summary_line());
     }
 }
 
@@ -169,7 +161,7 @@ mod tests {
             control_command: None,
             config_file: None,
             data_dir: std::env::temp_dir(),
-            log_level: "info".into(),
+            log_level: "warn".into(),
         }
     }
 

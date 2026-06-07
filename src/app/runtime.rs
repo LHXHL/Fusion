@@ -1,6 +1,5 @@
 use std::io::Error;
 
-use log::info;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -33,7 +32,7 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         return print_control_snapshot(&config.data_dir, control).await;
     }
 
-    info!("starting fusion unified runtime");
+    log::debug!("starting fusion unified runtime");
     set_global_wrapper_config(config.wrapper.clone());
     let identity = AgentIdentity::from_config(&config.identity);
     emit_bootstrap_summary(&config, &identity)?;

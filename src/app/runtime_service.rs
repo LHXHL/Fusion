@@ -57,10 +57,6 @@ pub async fn run_inbound_raw_once(
     let peer = tcp_mux::accept_mux_peer(identity, listener).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} from={} via=tcp",
-        peer.session.remote.agent_id, peer.peer_addr
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,
@@ -123,10 +119,6 @@ pub async fn run_inbound_raw_ws_once(
     let peer = ws_mux::accept_mux_peer(identity, listener, tls_acceptor).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} from={} via=ws",
-        peer.session.remote.agent_id, peer.peer_addr
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,
@@ -190,10 +182,6 @@ pub async fn run_inbound_raw_h2_once(
     let peer = h2_mux::accept_mux_peer(identity, listener, tls_acceptor).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} from={} via=h2",
-        peer.session.remote.agent_id, peer.peer_addr
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,
@@ -257,10 +245,6 @@ pub async fn run_inbound_raw_simplex_once(
     let peer = simplex_http_mux::accept_mux_peer_on(identity, listener, path).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} via=simplex-http",
-        peer.session.remote.agent_id
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,
@@ -323,10 +307,6 @@ pub async fn run_inbound_raw_simplex_oss_once(
     let peer = simplex_oss_mux::accept_mux_peer_on(identity, endpoint).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} via=simplex-oss",
-        peer.session.remote.agent_id
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,
@@ -395,10 +375,6 @@ pub async fn run_inbound_raw_simplex_dns_once(
     let peer = simplex_dns_mux::accept_mux_peer_on(identity, socket, path).await?;
     hub.lock().await.upsert(peer.session.clone());
     registry.lock().await.upsert_peer(peer.session.clone());
-    println!(
-        "session.inbound.peer={} via=simplex-dns",
-        peer.session.remote.agent_id
-    );
 
     let raw_service = match raw_service_definition.kind {
         ServiceKind::RemoteRaw(service) => service,

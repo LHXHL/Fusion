@@ -154,7 +154,7 @@ async fn handle_port_forward_client_with_failover(
         original: format!("port://{}", port_forward.summary_label()),
         kind: ServiceKind::RemotePortForward(port_forward),
     };
-    let (key, peer) = connect_simplex_http_peer(
+    let (_key, peer) = connect_simplex_http_peer(
         identity,
         &endpoints,
         &conn_policy,
@@ -162,7 +162,6 @@ async fn handle_port_forward_client_with_failover(
         &registry,
     )
     .await?;
-    println!("upstream.simplex-http.connect endpoint={key}");
     process_port_forward_simplex_http_connection(
         peer,
         remote_definition,
@@ -184,20 +183,11 @@ pub async fn run_outbound_port_forward_simplex_http_once(
     conn_policy: ConnPolicy,
 ) -> Result<(), Error> {
     let listener = port_forward.bind_listener().await?;
-    let local_addr = listener.local_addr()?;
+    let _local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    println!(
-        "service.local.active=port://{} via=simplex-http target={}",
-        local_addr,
-        port_forward.target_label()
-    );
 
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        println!(
-            "service.local.client={} via=port-forward-simplex-http",
-            client_addr
-        );
+        let (client, _client_addr) = listener.accept().await?;
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
         let port_forward = port_forward.clone();
