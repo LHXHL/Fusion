@@ -11,19 +11,44 @@ use crate::{
     app::{
         config::{ConnPolicy, TunnelEndpoint},
         conn_hub::order_endpoints,
+        runtime_status::{publish_upstream_pool_status, UpstreamPoolStatusMap},
     },
     session::hub::SessionHub,
     tunnel::{tcp_mux, ws_mux},
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TcpMuxUpstreamPool {
     peers: Arc<Mutex<HashMap<String, tcp_mux::MuxTcpPeer>>>,
+    status: Option<(UpstreamPoolStatusMap, String)>,
+}
+
+impl Default for TcpMuxUpstreamPool {
+    fn default() -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            status: None,
+        }
+    }
 }
 
 impl TcpMuxUpstreamPool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_status(status: UpstreamPoolStatusMap, handler: impl Into<String>) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            status: Some((status, handler.into())),
+        }
+    }
+
+    async fn sync_status(&self) {
+        let Some((status, handler)) = self.status.as_ref() else {
+            return;
+        };
+        publish_upstream_pool_status(status, handler, "tcp_mux", self.snapshot_keys().await).await;
     }
 
     async fn invalidate_if_stale(
@@ -60,6 +85,7 @@ impl TcpMuxUpstreamPool {
                 if self.invalidate_if_stale(&key, &peer, hub, registry).await {
                     continue;
                 }
+                self.sync_status().await;
                 return Ok((key, peer));
             }
             let host = endpoint.url.host.clone().ok_or_else(|| {
@@ -76,6 +102,7 @@ impl TcpMuxUpstreamPool {
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
                     self.peers.lock().await.insert(key.clone(), peer.clone());
+                    self.sync_status().await;
                     return Ok((key, peer));
                 }
                 Err(err) => last_err = Some(err),
@@ -86,6 +113,13 @@ impl TcpMuxUpstreamPool {
 
     pub async fn invalidate(&self, key: &str) {
         self.peers.lock().await.remove(key);
+        self.sync_status().await;
+    }
+
+    pub async fn snapshot_keys(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.peers.lock().await.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     pub async fn prune_stale(
@@ -100,18 +134,43 @@ impl TcpMuxUpstreamPool {
                 removed += 1;
             }
         }
+        self.sync_status().await;
         removed
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WsMuxUpstreamPool {
     peers: Arc<Mutex<HashMap<String, ws_mux::MuxWsPeer>>>,
+    status: Option<(UpstreamPoolStatusMap, String)>,
+}
+
+impl Default for WsMuxUpstreamPool {
+    fn default() -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            status: None,
+        }
+    }
 }
 
 impl WsMuxUpstreamPool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_status(status: UpstreamPoolStatusMap, handler: impl Into<String>) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            status: Some((status, handler.into())),
+        }
+    }
+
+    async fn sync_status(&self) {
+        let Some((status, handler)) = self.status.as_ref() else {
+            return;
+        };
+        publish_upstream_pool_status(status, handler, "ws_mux", self.snapshot_keys().await).await;
     }
 
     async fn invalidate_if_stale(
@@ -147,6 +206,7 @@ impl WsMuxUpstreamPool {
                 if self.invalidate_if_stale(&key, &peer, hub, registry).await {
                     continue;
                 }
+                self.sync_status().await;
                 return Ok((key, peer));
             }
             match ws_mux::connect_mux_peer(identity.clone(), &endpoint.url.original).await {
@@ -154,6 +214,7 @@ impl WsMuxUpstreamPool {
                     hub.lock().await.upsert(peer.session.clone());
                     registry.lock().await.upsert_peer(peer.session.clone());
                     self.peers.lock().await.insert(key.clone(), peer.clone());
+                    self.sync_status().await;
                     return Ok((key, peer));
                 }
                 Err(err) => last_err = Some(err),
@@ -164,6 +225,13 @@ impl WsMuxUpstreamPool {
 
     pub async fn invalidate(&self, key: &str) {
         self.peers.lock().await.remove(key);
+        self.sync_status().await;
+    }
+
+    pub async fn snapshot_keys(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.peers.lock().await.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 
     pub async fn prune_stale(
@@ -178,6 +246,7 @@ impl WsMuxUpstreamPool {
                 removed += 1;
             }
         }
+        self.sync_status().await;
         removed
     }
 }
@@ -191,6 +260,7 @@ mod tests {
         app::{
             config::{AgentIdentityConfig, ConnPolicy, TunnelEndpoint},
             runtime_orchestrator::RuntimeShared,
+            runtime_status::RuntimeConfigSummary,
         },
         tunnel::tcp_mux::accept_mux_peer_on,
         utils::url::ParsedUrl,
@@ -206,7 +276,12 @@ mod tests {
             name: Some("pool-server".into()),
             key: None,
         });
-        let shared = RuntimeShared::new(Vec::new(), &std::env::temp_dir()).await;
+        let shared = RuntimeShared::new(
+            Vec::new(),
+            &std::env::temp_dir(),
+            RuntimeConfigSummary::default(),
+        )
+        .await;
         let pool = TcpMuxUpstreamPool::new();
         let endpoint = TunnelEndpoint {
             url: ParsedUrl::parse(&format!("tcp://{}", addr)).unwrap(),
@@ -261,7 +336,12 @@ mod tests {
             name: Some("pool-server-stale".into()),
             key: None,
         });
-        let shared = RuntimeShared::new(Vec::new(), &std::env::temp_dir()).await;
+        let shared = RuntimeShared::new(
+            Vec::new(),
+            &std::env::temp_dir(),
+            RuntimeConfigSummary::default(),
+        )
+        .await;
         let pool = TcpMuxUpstreamPool::new();
         let endpoint = TunnelEndpoint {
             url: ParsedUrl::parse(&format!("tcp://{}", addr)).unwrap(),
@@ -309,7 +389,12 @@ mod tests {
             name: Some("pool-server-prune".into()),
             key: None,
         });
-        let shared = RuntimeShared::new(Vec::new(), &std::env::temp_dir()).await;
+        let shared = RuntimeShared::new(
+            Vec::new(),
+            &std::env::temp_dir(),
+            RuntimeConfigSummary::default(),
+        )
+        .await;
         let pool = TcpMuxUpstreamPool::new();
         let endpoint = TunnelEndpoint {
             url: ParsedUrl::parse(&format!("tcp://{}", addr)).unwrap(),
@@ -343,6 +428,106 @@ mod tests {
 
         let removed = pool.prune_stale(&shared.hub, &shared.registry).await;
         assert_eq!(removed, 1);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_upstream_pool_failover_skips_unreachable_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("pool-failover-server".into()),
+            key: None,
+        });
+        let shared = RuntimeShared::new(
+            Vec::new(),
+            &std::env::temp_dir(),
+            RuntimeConfigSummary::default(),
+        )
+        .await;
+        let pool = TcpMuxUpstreamPool::new();
+        let bad = TunnelEndpoint {
+            url: ParsedUrl::parse("tcp://127.0.0.1:1").unwrap(),
+        };
+        let good = TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("tcp://{}", addr)).unwrap(),
+        };
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("pool-failover-client".into()),
+            key: None,
+        });
+
+        let server = tokio::spawn(async move {
+            let _peer = accept_mux_peer_on(server_identity, &listener)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (_key, _peer) = pool
+            .acquire(
+                client_identity,
+                &[bad, good],
+                &ConnPolicy::Fallback,
+                &[],
+                &shared.hub,
+                &shared.registry,
+            )
+            .await
+            .unwrap();
+
+        let keys = pool.snapshot_keys().await;
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].contains(&addr.port().to_string()));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_upstream_pool_round_robin_policy_acquires_successfully() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("pool-rr-server".into()),
+            key: None,
+        });
+        let shared = RuntimeShared::new(
+            Vec::new(),
+            &std::env::temp_dir(),
+            RuntimeConfigSummary::default(),
+        )
+        .await;
+        let pool = TcpMuxUpstreamPool::new();
+        let bad = TunnelEndpoint {
+            url: ParsedUrl::parse("tcp://127.0.0.1:1").unwrap(),
+        };
+        let good = TunnelEndpoint {
+            url: ParsedUrl::parse(&format!("tcp://{}", addr)).unwrap(),
+        };
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("pool-rr-client".into()),
+            key: None,
+        });
+
+        let server = tokio::spawn(async move {
+            let _peer = accept_mux_peer_on(server_identity, &listener)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (_key, _peer) = pool
+            .acquire(
+                client_identity,
+                &[bad, good],
+                &ConnPolicy::RoundRobin,
+                &[],
+                &shared.hub,
+                &shared.registry,
+            )
+            .await
+            .unwrap();
 
         server.await.unwrap();
     }

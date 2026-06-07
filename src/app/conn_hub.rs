@@ -111,4 +111,30 @@ mod tests {
         let rnd = order_endpoints(&endpoints(), &ConnPolicy::Random).unwrap();
         assert_eq!(rnd.len(), 2);
     }
+
+    #[test]
+    fn round_robin_rotates_first_endpoint() {
+        let endpoints = endpoints();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let ordered = order_endpoints(&endpoints, &ConnPolicy::RoundRobin).unwrap();
+            seen.insert(ordered[0].url.original.clone());
+        }
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn up_and_down_connect_pools_are_split() {
+        let connects = endpoints();
+        let up = vec![connects[1].clone()];
+        let down = vec![connects[0].clone()];
+        assert_eq!(
+            select_upstream_pool(&connects, &up)[0].url.original,
+            "tcp://127.0.0.1:2"
+        );
+        assert_eq!(
+            select_downstream_pool(&connects, &down)[0].url.original,
+            "tcp://127.0.0.1:1"
+        );
+    }
 }

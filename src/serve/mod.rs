@@ -4,3 +4,4 @@ pub mod raw;
 pub mod service;
 pub mod shadowsocks;
 pub mod socks5;
+pub mod trojan;

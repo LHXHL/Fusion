@@ -8,7 +8,9 @@ pub enum DialTarget {
     Ws { url: String },
     Udp { addr: String },
     SimplexDns { url: String },
+    H2 { url: String },
     SimplexHttp { url: String },
+    StreamHttp { url: String },
     SimplexOss { url: String },
     Icmp { addr: String },
     Wg { addr: String },
@@ -43,10 +45,20 @@ pub fn classify_endpoint(endpoint: &TunnelEndpoint) -> Result<DialTarget, Error>
                 addr: format!("{host}:{port}"),
             })
         }
-        "simplex+dns" => Ok(DialTarget::SimplexDns {
+        scheme if crate::tunnel::dns_tunnel::is_dns_tunnel_scheme(scheme) => {
+            Ok(DialTarget::SimplexDns {
+                url: endpoint.url.original.clone(),
+            })
+        }
+        scheme if crate::tunnel::h2_tunnel::is_h2_tunnel_scheme(scheme) => Ok(DialTarget::H2 {
             url: endpoint.url.original.clone(),
         }),
-        "simplex+http" => Ok(DialTarget::SimplexHttp {
+        scheme if crate::tunnel::http_poll::is_http_poll_scheme(scheme) => {
+            Ok(DialTarget::SimplexHttp {
+                url: endpoint.url.original.clone(),
+            })
+        }
+        "streamhttp" => Ok(DialTarget::StreamHttp {
             url: endpoint.url.original.clone(),
         }),
         "simplex+oss" => Ok(DialTarget::SimplexOss {
@@ -189,6 +201,50 @@ mod tests {
             classify_endpoint(&wg).unwrap(),
             DialTarget::Wg {
                 addr: "127.0.0.1:5555".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_dns_and_h2_endpoints() {
+        let dns = TunnelEndpoint {
+            url: ParsedUrl::parse("dns://127.0.0.1:5353/task.local").unwrap(),
+        };
+        let h2 = TunnelEndpoint {
+            url: ParsedUrl::parse("h2://127.0.0.1:39200/tunnel").unwrap(),
+        };
+        assert_eq!(
+            classify_endpoint(&dns).unwrap(),
+            DialTarget::SimplexDns {
+                url: "dns://127.0.0.1:5353/task.local".to_string()
+            }
+        );
+        assert_eq!(
+            classify_endpoint(&h2).unwrap(),
+            DialTarget::H2 {
+                url: "h2://127.0.0.1:39200/tunnel".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_http_long_poll_and_streamhttp_endpoints() {
+        let http = TunnelEndpoint {
+            url: ParsedUrl::parse("http://127.0.0.1:39090/task").unwrap(),
+        };
+        let streamhttp = TunnelEndpoint {
+            url: ParsedUrl::parse("streamhttp://127.0.0.1:39100/events").unwrap(),
+        };
+        assert_eq!(
+            classify_endpoint(&http).unwrap(),
+            DialTarget::SimplexHttp {
+                url: "http://127.0.0.1:39090/task".to_string()
+            }
+        );
+        assert_eq!(
+            classify_endpoint(&streamhttp).unwrap(),
+            DialTarget::StreamHttp {
+                url: "streamhttp://127.0.0.1:39100/events".to_string()
             }
         );
     }

@@ -373,11 +373,14 @@ fn build_app_config(value: CliArgs, value_sources: CliValueSources) -> Result<Ap
         },
     };
 
+    let (connects, up_connects, down_connects) =
+        crate::app::config::merge_connect_endpoints(&connects, &up_connects, &down_connects)?;
+
     Ok(AppConfig {
         listens: parse_tunnel_list(&listens)?,
-        connects: parse_tunnel_list(&connects)?,
-        up_connects: parse_tunnel_list(&up_connects)?,
-        down_connects: parse_tunnel_list(&down_connects)?,
+        connects,
+        up_connects,
+        down_connects,
         local_serves: parse_serve_list(&local_serves)?,
         remote_serves: parse_serve_list(&remote_serves)?,
         proxy_chain,
@@ -696,11 +699,7 @@ fn parse_task_request_from_command(args: &CliArgs) -> Result<Option<TaskRequestC
 fn parse_tunnel_list(values: &[String]) -> Result<Vec<TunnelEndpoint>, Error> {
     values
         .iter()
-        .map(|value| {
-            Ok(TunnelEndpoint {
-                url: ParsedUrl::parse(value)?,
-            })
-        })
+        .map(|value| Ok(crate::app::config::parse_tunnel_endpoint(value)?.0))
         .collect()
 }
 

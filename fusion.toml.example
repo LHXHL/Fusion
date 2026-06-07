@@ -18,6 +18,7 @@ log_level = "info"
 
 [identity]
 name = "node-a"
+# key = "fusion-secret"   # optional shared-key AEAD (-k)
 
 [retry]
 interval_secs = 10
@@ -27,39 +28,130 @@ max_interval_secs = 300
 compress = false
 padding = 0
 
-# Example profiles:
-#
-# TCP listener:
+# ---------------------------------------------------------------------------
+# Profile: TCP listener + SOCKS5/HTTP local entry + remote raw egress
+# ---------------------------------------------------------------------------
 # listens = ["tcp://0.0.0.0:34996"]
-#
-# WSS listener:
-# listens = ["wss://0.0.0.0:8443/tunnel?tls-cert=/tmp/fusion-cert.pem&tls-key=/tmp/fusion-key.pem"]
-#
-# Multi-upstream:
-# connects = ["tcp://127.0.0.1:34996", "ws://127.0.0.1:38080/tunnel"]
+# connects = ["tcp://127.0.0.1:34996"]
+# local_serves = ["socks5://127.0.0.1:1080", "http://127.0.0.1:8080"]
+# remote_serves = ["raw://"]
+# conn_policy = "fallback"
+
+# ---------------------------------------------------------------------------
+# Profile: WSS listener with explicit PEM (mTLS optional)
+# ---------------------------------------------------------------------------
+# listens = [
+#   "wss://0.0.0.0:8443/tunnel?tls-cert=/path/to/cert.pem&tls-key=/path/to/key.pem&tls-client-ca=/path/to/client-ca.pem",
+# ]
+# connects = [
+#   "wss://127.0.0.1:8443/tunnel?tls-ca=/path/to/ca.pem&tls-client-cert=/path/to/client-cert.pem&tls-client-key=/path/to/client-key.pem",
+# ]
+
+# ---------------------------------------------------------------------------
+# Profile: multi-upstream + conn policy + proxy chain
+# ---------------------------------------------------------------------------
+# connects = [
+#   "tcp://127.0.0.1:34996",
+#   "ws://127.0.0.1:38080/tunnel",
+# ]
 # conn_policy = "round-robin"
-#
-# Up/down split:
+# front_proxy = "http://127.0.0.1:8080?username=demo&password=secret"
+# proxy_chain = ["socks5://127.0.0.1:1080?username=demo&password=secret"]
+
+# ---------------------------------------------------------------------------
+# Profile: up/down connect split (separate upstream/downstream pools)
+# ---------------------------------------------------------------------------
 # up_connects = ["tcp://127.0.0.1:34996"]
 # down_connects = ["ws://127.0.0.1:38080/tunnel"]
-#
-# Local entry service:
-# local_serves = ["socks5://127.0.0.1:1080", "http://127.0.0.1:8080"]
-#
-# Local entry service with auth:
-# local_serves = [
-#   "socks5://127.0.0.1:1080?username=demo&password=secret",
-#   "http://127.0.0.1:8080?username=demo&password=secret",
-# ]
-#
-# Remote egress:
-# remote_serves = ["raw://", "port://127.0.0.1:8080->example.com:80"]
-#
-# Proxy chain:
-# front_proxy = "http://127.0.0.1:8080"
-# proxy_chain = ["socks5://127.0.0.1:1080"]
-#
-# Wrapper:
+
+# ---------------------------------------------------------------------------
+# Profile: wrapper pipeline + shared key
+# ---------------------------------------------------------------------------
+# [identity]
+# name = "node-a"
+# key = "fusion-secret"
 # [wrapper]
 # compress = true
 # padding = 32
+
+# ---------------------------------------------------------------------------
+# Profile: HTTP long-poll tunnel (G1, same stack as simplex+http)
+# ---------------------------------------------------------------------------
+# listens = ["http://0.0.0.0:39090/task"]
+# connects = ["http://127.0.0.1:39090/task"]
+#
+# ---------------------------------------------------------------------------
+# Profile: DNS query tunnel (K1, alias of simplex+dns stack)
+# listens = ["dns://0.0.0.0:5353/task.local"]
+# connects = ["dns://127.0.0.1:5353/task.local"]
+
+# Profile: HTTP/2 mux tunnel (K2–K4)
+# listens = ["h2://0.0.0.0:39200/tunnel"]
+# connects = ["h2://127.0.0.1:39200/tunnel"]
+# h2s example:
+# listens = ["h2s://0.0.0.0:443/tunnel?tls-cert=/path/cert.pem&tls-key=/path/key.pem"]
+# connects = ["h2s://127.0.0.1:443/tunnel?tls-insecure=1"]
+
+# Profile: streamhttp SSE downlink (G2, direct task)
+# ---------------------------------------------------------------------------
+# listens = ["streamhttp://0.0.0.0:39100/task"]
+# connects = ["streamhttp://127.0.0.1:39100/task"]
+#
+# ---------------------------------------------------------------------------
+# Profile: up-/down- URL prefix (G4, equivalent to --up-connect/--down-connect)
+# ---------------------------------------------------------------------------
+# connects = [
+#   "up-tcp://127.0.0.1:34996",
+#   "down-ws://127.0.0.1:38080/tunnel",
+# ]
+#
+# ---------------------------------------------------------------------------
+# Profile: Simplex HTTP task server
+# ---------------------------------------------------------------------------
+# listens = ["simplex+http://0.0.0.0:39090/task"]
+# connects = ["simplex+http://127.0.0.1:39090/task"]
+# See docs/simplex-transport.md for dns/oss variants.
+
+# ---------------------------------------------------------------------------
+# Profile: Simplex DNS task (UDP DNS channel)
+# ---------------------------------------------------------------------------
+# listens = ["simplex+dns://0.0.0.0:5353/task.local"]
+# connects = ["simplex+dns://127.0.0.1:5353/task.local"]
+
+# ---------------------------------------------------------------------------
+# Profile: Simplex OSS mailbox (shared local root directory)
+# -------------------------------------------------------------------
+# listens = ["simplex+oss://mesh-server/channel?root=/tmp/fusion-simplex-oss"]
+# connects = ["simplex+oss://mesh-server/channel?root=/tmp/fusion-simplex-oss"]
+
+# ---------------------------------------------------------------------------
+# Profile: Shadowsocks entry (method=none or aes-256-gcm-siv)
+# ---------------------------------------------------------------------------
+# local_serves = ["ss://127.0.0.1:8388?method=none"]
+# remote_serves = ["raw://"]
+# connects = ["tcp://127.0.0.1:34996"]
+#
+# AEAD request frame mode (Fusion framing; not full Shadowsocks UDP associate):
+# local_serves = ["ss://127.0.0.1:8388?method=aes-256-gcm-siv&password=secret"]
+
+# ---------------------------------------------------------------------------
+# Profile: Trojan entry (H3)
+# ---------------------------------------------------------------------------
+# local_serves = ["trojan://127.0.0.1:443?password=secret"]
+# remote_serves = ["raw://"]
+# connects = ["tcp://127.0.0.1:34996"]
+#
+# With TLS on the local Trojan listener:
+# local_serves = ["trojan://127.0.0.1:443?password=secret&tls-cert=/path/cert.pem&tls-key=/path/key.pem"]
+
+# ---------------------------------------------------------------------------
+# Profile: SOCKS5 over simplex+http mux (H4)
+# ---------------------------------------------------------------------------
+# local_serves = ["socks5://127.0.0.1:1080"]
+# remote_serves = ["raw://"]
+# connects = ["simplex+http://127.0.0.1:39090/socks"]
+
+# ---------------------------------------------------------------------------
+# Profile: remote port forward
+# ---------------------------------------------------------------------------
+# remote_serves = ["port://127.0.0.1:18080->example.com:80"]

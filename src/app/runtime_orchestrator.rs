@@ -13,27 +13,39 @@ use crate::{
         runtime_http::{run_outbound_http_once, run_outbound_http_ws_once},
         runtime_mode::{
             collect_remote_port_forward_services, decide_inbound_runtime_mode,
-            decide_outbound_runtime_mode, InboundRuntimeMode, OutboundRuntimeMode,
+            decide_outbound_runtime_mode, InboundRuntimeMode,
+            OutboundRuntimeMode,
+        },
+        runtime_portfwd::run_outbound_port_forward_simplex_http_once,
+        runtime_h2::{
+            run_inbound_task_server_h2, run_outbound_relay_peer_h2, H2RelayStreamAllocator,
+            H2TaskPeerMap,
         },
         runtime_peer::{
-            run_inbound_task_server_simplex_dns,
-            run_inbound_task_server_simplex_http, run_inbound_task_server_simplex_oss,
-            run_inbound_task_server_tcp, run_inbound_task_server_ws, run_outbound_relay_peer_tcp,
-            run_outbound_relay_peer_simplex_dns,
+            run_inbound_task_server_simplex_dns, run_inbound_task_server_simplex_http,
+            run_inbound_task_server_simplex_oss, run_inbound_task_server_tcp,
+            run_inbound_task_server_ws, run_outbound_relay_peer_simplex_dns,
             run_outbound_relay_peer_simplex_http, run_outbound_relay_peer_simplex_oss,
-            run_outbound_relay_peer_ws, SimplexDnsRelayStreamAllocator,
-            SimplexDnsTaskPeerMap, SimplexHttpRelayStreamAllocator, SimplexHttpTaskPeerMap,
-            SimplexOssRelayStreamAllocator, SimplexOssTaskPeerMap, TcpRelayStreamAllocator,
-            TcpTaskPeerMap, WsRelayStreamAllocator, WsTaskPeerMap,
+            run_outbound_relay_peer_tcp, run_outbound_relay_peer_ws,
+            SimplexDnsRelayStreamAllocator, SimplexDnsTaskPeerMap, SimplexHttpRelayStreamAllocator,
+            SimplexHttpTaskPeerMap, SimplexOssRelayStreamAllocator, SimplexOssTaskPeerMap,
+            TcpRelayStreamAllocator, TcpTaskPeerMap, WsRelayStreamAllocator, WsTaskPeerMap,
         },
         runtime_service::{
-            run_inbound_raw_once, run_inbound_raw_simplex_dns_once,
-            run_inbound_raw_simplex_once, run_inbound_raw_simplex_oss_once,
-            run_inbound_raw_ws_once, run_remote_port_forward_listener,
+            run_inbound_raw_once, run_inbound_raw_h2_once, run_inbound_raw_simplex_dns_once,
+            run_inbound_raw_simplex_once,
+            run_inbound_raw_simplex_oss_once, run_inbound_raw_ws_once,
+            run_remote_port_forward_listener,
         },
         runtime_shadowsocks::{run_outbound_shadowsocks_once, run_outbound_shadowsocks_ws_once},
-        runtime_socks5::{run_outbound_socks5_once, run_outbound_socks5_ws_once},
-        runtime_status::{spawn_status_snapshot_task, RelayLinkMap},
+        runtime_trojan::{run_outbound_trojan_once, run_outbound_trojan_ws_once},
+        runtime_socks5::{
+            run_outbound_socks5_once, run_outbound_socks5_simplex_http_once,
+            run_outbound_socks5_ws_once,
+        },
+        runtime_status::{
+            spawn_status_snapshot_task, RelayLinkMap, RuntimeConfigSummary, UpstreamPoolStatusMap,
+        },
         runtime_task::run_outbound_task_once,
     },
     serve::{portfwd::PortForwardService, service::ServiceKind},
@@ -41,7 +53,7 @@ use crate::{
     tunnel::{
         dialer::{classify_endpoint, DialTarget},
         listener::{bind_endpoint, BoundListenerHandle},
-        memory, simplex_dns, simplex_http, simplex_oss, tcp, udp, unix, ws,
+        memory, simplex_dns, simplex_http, simplex_oss, streamhttp, tcp, udp, unix, ws,
     },
     utils::url::ParsedUrl,
 };
@@ -52,28 +64,37 @@ pub struct RuntimeShared {
     pub registry: Arc<Mutex<AgentRegistry>>,
     pub tcp_task_peers: TcpTaskPeerMap,
     pub ws_task_peers: WsTaskPeerMap,
+    pub h2_task_peers: H2TaskPeerMap,
     pub simplex_dns_task_peers: SimplexDnsTaskPeerMap,
     pub simplex_http_task_peers: SimplexHttpTaskPeerMap,
     pub simplex_oss_task_peers: SimplexOssTaskPeerMap,
     pub tcp_relay_stream_allocator: TcpRelayStreamAllocator,
     pub ws_relay_stream_allocator: WsRelayStreamAllocator,
+    pub h2_relay_stream_allocator: H2RelayStreamAllocator,
     pub simplex_dns_relay_stream_allocator: SimplexDnsRelayStreamAllocator,
     pub simplex_http_relay_stream_allocator: SimplexHttpRelayStreamAllocator,
     pub simplex_oss_relay_stream_allocator: SimplexOssRelayStreamAllocator,
     pub relay_links: RelayLinkMap,
+    pub upstream_pools: UpstreamPoolStatusMap,
 }
 
 impl RuntimeShared {
-    pub async fn new(exposed_service_labels: Vec<String>, data_dir: &std::path::Path) -> Self {
+    pub async fn new(
+        exposed_service_labels: Vec<String>,
+        data_dir: &std::path::Path,
+        config: RuntimeConfigSummary,
+    ) -> Self {
         let hub = Arc::new(Mutex::new(SessionHub::new()));
         let registry = Arc::new(Mutex::new(AgentRegistry::new()));
         let tcp_task_peers: TcpTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let ws_task_peers: WsTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
+        let h2_task_peers: H2TaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let simplex_dns_task_peers: SimplexDnsTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let simplex_http_task_peers: SimplexHttpTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let simplex_oss_task_peers: SimplexOssTaskPeerMap = Arc::new(Mutex::new(HashMap::new()));
         let tcp_relay_stream_allocator: TcpRelayStreamAllocator = Arc::new(Mutex::new(100_000));
         let ws_relay_stream_allocator: WsRelayStreamAllocator = Arc::new(Mutex::new(200_000));
+        let h2_relay_stream_allocator: H2RelayStreamAllocator = Arc::new(Mutex::new(210_000));
         let simplex_dns_relay_stream_allocator: SimplexDnsRelayStreamAllocator =
             Arc::new(Mutex::new(250_000));
         let simplex_http_relay_stream_allocator: SimplexHttpRelayStreamAllocator =
@@ -81,6 +102,7 @@ impl RuntimeShared {
         let simplex_oss_relay_stream_allocator: SimplexOssRelayStreamAllocator =
             Arc::new(Mutex::new(400_000));
         let relay_links: RelayLinkMap = Arc::new(Mutex::new(HashMap::new()));
+        let upstream_pools: UpstreamPoolStatusMap = Arc::new(Mutex::new(Vec::new()));
 
         registry
             .lock()
@@ -92,6 +114,8 @@ impl RuntimeShared {
             hub.clone(),
             registry.clone(),
             relay_links.clone(),
+            upstream_pools.clone(),
+            config,
         );
 
         Self {
@@ -99,15 +123,18 @@ impl RuntimeShared {
             registry,
             tcp_task_peers,
             ws_task_peers,
+            h2_task_peers,
             simplex_dns_task_peers,
             simplex_http_task_peers,
             simplex_oss_task_peers,
             tcp_relay_stream_allocator,
             ws_relay_stream_allocator,
+            h2_relay_stream_allocator,
             simplex_dns_relay_stream_allocator,
             simplex_http_relay_stream_allocator,
             simplex_oss_relay_stream_allocator,
             relay_links,
+            upstream_pools,
         }
     }
 }
@@ -257,6 +284,59 @@ pub async fn spawn_inbound_tasks(
                         shared.registry,
                         shared.ws_task_peers,
                         shared.ws_relay_stream_allocator,
+                        shared.relay_links,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::RawH2 => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected h2 listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let raw_service = inbound_raw_service.clone().unwrap();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_raw_h2_once(
+                        listener_identity,
+                        listener,
+                        bound.ws_tls_acceptor,
+                        raw_service,
+                        shared.hub,
+                        shared.registry,
+                    )
+                    .await
+                    {
+                        eprintln!("session.inbound.error={err}");
+                    }
+                }));
+            }
+            InboundRuntimeMode::TaskH2 => {
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected h2 listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                let listener_services = exposed_service_labels.to_vec();
+                println!("listen.active={}", bound.display_url);
+                info!("listen.active={}", bound.display_url);
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = run_inbound_task_server_h2(
+                        listener_identity,
+                        listener,
+                        bound.ws_tls_acceptor,
+                        listener_services,
+                        shared.hub,
+                        shared.registry,
+                        shared.h2_task_peers,
+                        shared.h2_relay_stream_allocator,
                         shared.relay_links,
                     )
                     .await
@@ -422,6 +502,33 @@ pub async fn spawn_inbound_tasks(
                     }
                 }));
             }
+            InboundRuntimeMode::TaskStreamHttp => {
+                let display_url = bound.display_url.clone();
+                let path = match ParsedUrl::parse(&display_url) {
+                    Ok(parsed) => parsed.path,
+                    Err(err) => {
+                        eprintln!("session.inbound.error=invalid streamhttp listener url: {err}");
+                        continue;
+                    }
+                };
+                let BoundListenerHandle::Tcp(listener) = bound.handle else {
+                    eprintln!("session.inbound.error=expected streamhttp listener handle");
+                    continue;
+                };
+                let listener_identity = identity.clone();
+                let shared = shared.clone();
+                println!("listen.active={}", display_url);
+                info!("listen.active={}", display_url);
+                tasks.push(tokio::spawn(async move {
+                    match streamhttp::accept_peer_on(listener_identity, listener, &path).await {
+                        Ok(peer) => {
+                            shared.hub.lock().await.upsert(peer.session.clone());
+                            shared.registry.lock().await.upsert_peer(peer.session);
+                        }
+                        Err(err) => eprintln!("session.inbound.error={err}"),
+                    }
+                }));
+            }
             InboundRuntimeMode::TaskSimplexOss => {
                 let BoundListenerHandle::SimplexOss(endpoint) = bound.handle else {
                     eprintln!("session.inbound.error=expected simplex oss listener handle");
@@ -484,7 +591,8 @@ pub async fn spawn_inbound_tasks(
                 println!("listen.active={}", bound.display_url);
                 info!("listen.active={}", bound.display_url);
                 tasks.push(tokio::spawn(async move {
-                    match simplex_oss::run_inbound_session_once(listener_identity, &endpoint).await {
+                    match simplex_oss::run_inbound_session_once(listener_identity, &endpoint).await
+                    {
                         Ok((session, _)) => {
                             shared.hub.lock().await.upsert(session.clone());
                             shared.registry.lock().await.upsert_peer(session);
@@ -588,7 +696,9 @@ pub fn spawn_outbound_tasks(
     outbound_socks5_service: Option<crate::serve::service::ServiceDefinition>,
     outbound_http_proxy_service: Option<crate::serve::service::ServiceDefinition>,
     outbound_shadowsocks_service: Option<crate::serve::service::ServiceDefinition>,
+    outbound_trojan_service: Option<crate::serve::service::ServiceDefinition>,
     outbound_egress_service: Option<crate::serve::service::ServiceDefinition>,
+    remote_port_forward_services: &[PortForwardService],
     exposed_service_labels: &[String],
 ) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::new();
@@ -645,7 +755,10 @@ pub fn spawn_outbound_tasks(
         let local_socks = outbound_socks5_service.clone();
         let local_http_proxy = outbound_http_proxy_service.clone();
         let local_shadowsocks = outbound_shadowsocks_service.clone();
+        let local_trojan = outbound_trojan_service.clone();
         let remote_egress = outbound_egress_service.clone();
+        let port_forward = remote_port_forward_services.first().cloned();
+        let has_remote_port_forward = port_forward.is_some();
         let exposed_service_labels = exposed_service_labels.to_vec();
         let has_listener = !config.listens.is_empty();
         let remote_peer_id = config.remote_peer_id.clone();
@@ -661,7 +774,9 @@ pub fn spawn_outbound_tasks(
                     local_socks.is_some(),
                     local_http_proxy.is_some(),
                     local_shadowsocks.is_some(),
+                    local_trojan.is_some(),
                     remote_egress.is_some(),
+                    has_remote_port_forward,
                     has_listener,
                 ) {
                     OutboundRuntimeMode::Task => unreachable!(),
@@ -676,6 +791,7 @@ pub fn spawn_outbound_tasks(
                             shared.registry.clone(),
                             conn_policy.clone(),
                             proxy_chain.clone(),
+                            shared.upstream_pools.clone(),
                         )
                         .await
                     }
@@ -685,6 +801,32 @@ pub fn spawn_outbound_tasks(
                             &upstream_pool,
                             local_socks.clone().unwrap(),
                             remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            conn_policy.clone(),
+                            shared.upstream_pools.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::Socks5SimplexHttp => {
+                        run_outbound_socks5_simplex_http_once(
+                            connect_identity.clone(),
+                            &upstream_pool,
+                            local_socks.clone().unwrap(),
+                            remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            conn_policy.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::PortForwardSimplexHttp => {
+                        run_outbound_port_forward_simplex_http_once(
+                            connect_identity.clone(),
+                            &upstream_pool,
+                            port_forward.clone().expect("port forward service"),
                             remote_peer_id.clone(),
                             shared.hub.clone(),
                             shared.registry.clone(),
@@ -703,6 +845,7 @@ pub fn spawn_outbound_tasks(
                             shared.registry.clone(),
                             conn_policy.clone(),
                             proxy_chain.clone(),
+                            shared.upstream_pools.clone(),
                         )
                         .await
                     }
@@ -716,6 +859,7 @@ pub fn spawn_outbound_tasks(
                             shared.hub.clone(),
                             shared.registry.clone(),
                             conn_policy.clone(),
+                            shared.upstream_pools.clone(),
                         )
                         .await
                     }
@@ -730,6 +874,7 @@ pub fn spawn_outbound_tasks(
                             shared.registry.clone(),
                             conn_policy.clone(),
                             proxy_chain.clone(),
+                            shared.upstream_pools.clone(),
                         )
                         .await
                     }
@@ -743,6 +888,36 @@ pub fn spawn_outbound_tasks(
                             shared.hub.clone(),
                             shared.registry.clone(),
                             conn_policy.clone(),
+                            shared.upstream_pools.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::TrojanTcp => {
+                        run_outbound_trojan_once(
+                            connect_identity.clone(),
+                            &upstream_pool,
+                            local_trojan.clone().unwrap(),
+                            remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            conn_policy.clone(),
+                            proxy_chain.clone(),
+                            shared.upstream_pools.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::TrojanWs => {
+                        run_outbound_trojan_ws_once(
+                            connect_identity.clone(),
+                            &upstream_pool,
+                            local_trojan.clone().unwrap(),
+                            remote_egress.clone().unwrap(),
+                            remote_peer_id.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            conn_policy.clone(),
+                            shared.upstream_pools.clone(),
                         )
                         .await
                     }
@@ -768,6 +943,19 @@ pub fn spawn_outbound_tasks(
                             shared.registry.clone(),
                             shared.ws_task_peers.clone(),
                             shared.ws_relay_stream_allocator.clone(),
+                            shared.relay_links.clone(),
+                        )
+                        .await
+                    }
+                    OutboundRuntimeMode::RelayH2 => {
+                        run_outbound_relay_peer_h2(
+                            connect_identity.clone(),
+                            &connect_endpoint,
+                            exposed_service_labels.clone(),
+                            shared.hub.clone(),
+                            shared.registry.clone(),
+                            shared.h2_task_peers.clone(),
+                            shared.h2_relay_stream_allocator.clone(),
                             shared.relay_links.clone(),
                         )
                         .await
@@ -895,6 +1083,16 @@ async fn run_outbound_once(
                         session.remote.agent_id, url
                     );
                 }
+                DialTarget::H2 { url } => {
+                    let peer =
+                        crate::tunnel::h2_mux::connect_mux_peer(identity.clone(), &url).await?;
+                    hub.lock().await.upsert(peer.session.clone());
+                    registry.lock().await.upsert_peer(peer.session.clone());
+                    println!(
+                        "session.outbound.peer={} to={} via=h2",
+                        peer.session.remote.agent_id, url
+                    );
+                }
                 DialTarget::Udp { addr } => {
                     let (session, _) =
                         udp::run_outbound_session_once(identity.clone(), &addr).await?;
@@ -921,7 +1119,17 @@ async fn run_outbound_once(
                     hub.lock().await.upsert(session.clone());
                     registry.lock().await.upsert_peer(session.clone());
                     println!(
-                        "session.outbound.peer={} to={} via=simplex-http",
+                        "session.outbound.peer={} to={} via=http-long-poll",
+                        session.remote.agent_id, url
+                    );
+                }
+                DialTarget::StreamHttp { url } => {
+                    let (session, _) =
+                        streamhttp::run_outbound_session_once(identity.clone(), &url).await?;
+                    hub.lock().await.upsert(session.clone());
+                    registry.lock().await.upsert_peer(session.clone());
+                    println!(
+                        "session.outbound.peer={} to={} via=streamhttp",
                         session.remote.agent_id, url
                     );
                 }
@@ -996,6 +1204,7 @@ pub fn find_runtime_services(
     Option<crate::serve::service::ServiceDefinition>,
     Option<crate::serve::service::ServiceDefinition>,
     Option<crate::serve::service::ServiceDefinition>,
+    Option<crate::serve::service::ServiceDefinition>,
     Vec<PortForwardService>,
 ) {
     let inbound_raw_service = remote_services
@@ -1014,6 +1223,10 @@ pub fn find_runtime_services(
         .iter()
         .find(|svc| matches!(svc.kind, ServiceKind::LocalShadowsocks(_)))
         .cloned();
+    let outbound_trojan_service = local_services
+        .iter()
+        .find(|svc| matches!(svc.kind, ServiceKind::LocalTrojan(_)))
+        .cloned();
     let outbound_egress_service = remote_services
         .iter()
         .find(|svc| {
@@ -1030,6 +1243,7 @@ pub fn find_runtime_services(
         outbound_socks5_service,
         outbound_http_proxy_service,
         outbound_shadowsocks_service,
+        outbound_trojan_service,
         outbound_egress_service,
         remote_port_forward_services,
     )

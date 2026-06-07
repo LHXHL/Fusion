@@ -6,6 +6,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::{
@@ -13,11 +14,162 @@ use crate::{
         registry::{AgentRegistry, RegisteredPeer, RegisteredRoute, RegisteredStream},
         state::AgentRuntimeState,
     },
-    app::config::{ControlCommandConfig, StatusScope},
+    app::config::{AppConfig, ControlCommandConfig, StatusScope},
+    error::{recent_errors_snapshot, RecordedError},
     session::{hub::SessionHub, peer::PeerSession},
 };
 
 pub type RelayLinkMap = Arc<Mutex<HashMap<String, RelayStreamLink>>>;
+pub type UpstreamPoolStatusMap = Arc<Mutex<Vec<UpstreamPoolEntryStatus>>>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UpstreamPoolEntryStatus {
+    pub handler: String,
+    pub transport: String,
+    pub cached_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UpstreamConfigSummary {
+    pub conn_policy: String,
+    pub connect_urls: Vec<String>,
+    pub up_connect_urls: Vec<String>,
+    pub down_connect_urls: Vec<String>,
+    pub proxy_chain_count: usize,
+    pub front_proxy_configured: bool,
+}
+
+pub async fn publish_upstream_pool_status(
+    status: &UpstreamPoolStatusMap,
+    handler: &str,
+    transport: &str,
+    cached_keys: Vec<String>,
+) {
+    let mut guard = status.lock().await;
+    if let Some(entry) = guard
+        .iter_mut()
+        .find(|entry| entry.handler == handler && entry.transport == transport)
+    {
+        entry.cached_keys = cached_keys;
+        return;
+    }
+    guard.push(UpstreamPoolEntryStatus {
+        handler: handler.to_string(),
+        transport: transport.to_string(),
+        cached_keys,
+    });
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeConfigSummary {
+    pub wrapper_compress: bool,
+    pub wrapper_padding: Option<usize>,
+    pub shared_key_configured: bool,
+    #[serde(default)]
+    pub upstream: UpstreamConfigSummary,
+    #[serde(default)]
+    pub tls: crate::tunnel::tls::TlsUsageSummary,
+}
+
+impl RuntimeConfigSummary {
+    pub fn from_app_config(config: &AppConfig) -> Self {
+        let connect_urls: Vec<_> = config
+            .connects
+            .iter()
+            .chain(config.up_connects.iter())
+            .chain(config.down_connects.iter())
+            .map(|endpoint| endpoint.url.clone())
+            .collect();
+        let listen_urls: Vec<_> = config
+            .listens
+            .iter()
+            .map(|endpoint| endpoint.url.clone())
+            .collect();
+        let tls = crate::tunnel::tls::summarize_tls_from_urls(&listen_urls, &connect_urls);
+        Self {
+            wrapper_compress: config.wrapper.compress,
+            wrapper_padding: config.wrapper.padding,
+            shared_key_configured: config.identity.key.is_some(),
+            upstream: UpstreamConfigSummary {
+                conn_policy: format!("{:?}", config.conn_policy),
+                connect_urls: config
+                    .connects
+                    .iter()
+                    .map(|endpoint| endpoint.url.original.clone())
+                    .collect(),
+                up_connect_urls: config
+                    .up_connects
+                    .iter()
+                    .map(|endpoint| endpoint.url.original.clone())
+                    .collect(),
+                down_connect_urls: config
+                    .down_connects
+                    .iter()
+                    .map(|endpoint| endpoint.url.original.clone())
+                    .collect(),
+                proxy_chain_count: config.proxy_chain.len(),
+                front_proxy_configured: config.front_proxy.is_some(),
+            },
+            tls,
+        }
+    }
+
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("config.wrapper.compress={}", self.wrapper_compress),
+            format!(
+                "config.wrapper.padding={}",
+                self.wrapper_padding
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "disabled".to_string())
+            ),
+            format!(
+                "config.shared_key={}",
+                if self.shared_key_configured {
+                    "configured"
+                } else {
+                    "disabled"
+                }
+            ),
+            format!("config.conn_policy={}", self.upstream.conn_policy),
+            format!("config.connect.count={}", self.upstream.connect_urls.len()),
+            format!(
+                "config.up_connect.count={}",
+                self.upstream.up_connect_urls.len()
+            ),
+            format!(
+                "config.down_connect.count={}",
+                self.upstream.down_connect_urls.len()
+            ),
+            format!(
+                "config.proxy.chain.count={}",
+                self.upstream.proxy_chain_count + usize::from(self.upstream.front_proxy_configured)
+            ),
+            format!("config.tls.wss_listen={}", self.tls.wss_listen_endpoints),
+            format!("config.tls.wss_connect={}", self.tls.wss_connect_endpoints),
+            format!("config.tls.insecure={}", self.tls.insecure_enabled),
+            format!("config.tls.custom_ca={}", self.tls.custom_ca_configured),
+            format!(
+                "config.tls.client_identity={}",
+                self.tls.client_identity_configured
+            ),
+            format!(
+                "config.tls.listener_mtls={}",
+                self.tls.listener_mutual_tls_enabled
+            ),
+        ];
+        for url in &self.upstream.connect_urls {
+            lines.push(format!("config.connect={url}"));
+        }
+        for url in &self.upstream.up_connect_urls {
+            lines.push(format!("config.up_connect={url}"));
+        }
+        for url in &self.upstream.down_connect_urls {
+            lines.push(format!("config.down_connect={url}"));
+        }
+        lines
+    }
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeStatusSnapshot {
@@ -32,6 +184,12 @@ pub struct RuntimeStatusSnapshot {
     pub streams: Vec<RegisteredStream>,
     pub local_services: Vec<String>,
     pub relay_links: Vec<RelayStreamLink>,
+    #[serde(default)]
+    pub config: RuntimeConfigSummary,
+    #[serde(default)]
+    pub upstream_pools: Vec<UpstreamPoolEntryStatus>,
+    #[serde(default)]
+    pub recent_errors: Vec<RecordedError>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -113,6 +271,8 @@ pub async fn write_status_snapshot(
     hub: &Arc<Mutex<SessionHub>>,
     registry: &Arc<Mutex<AgentRegistry>>,
     relay_links: &RelayLinkMap,
+    upstream_pools: &UpstreamPoolStatusMap,
+    config: &RuntimeConfigSummary,
 ) -> Result<(), Error> {
     tokio::fs::create_dir_all(data_dir).await?;
     let hub_guard = hub.lock().await;
@@ -129,6 +289,12 @@ pub async fn write_status_snapshot(
     drop(registry_guard);
 
     lines.extend(registry_summary.clone());
+    lines.extend(config.summary_lines());
+    let recent_errors = recent_errors_snapshot();
+    lines.push(format!("recent.error_count={}", recent_errors.len()));
+    for entry in &recent_errors {
+        lines.push(entry.summary_line());
+    }
     let relay_links = {
         let guard = relay_links.lock().await;
         let mut links: Vec<_> = guard.values().cloned().collect();
@@ -143,6 +309,25 @@ pub async fn write_status_snapshot(
     lines.push(format!("relay.link_count={}", relay_links.len()));
     for link in &relay_links {
         lines.push(link.summary_line());
+    }
+    let upstream_pools = {
+        let guard = upstream_pools.lock().await;
+        let mut pools = guard.clone();
+        pools.sort_by(|a, b| {
+            a.handler
+                .cmp(&b.handler)
+                .then(a.transport.cmp(&b.transport))
+        });
+        pools
+    };
+    lines.push(format!("upstream.pool_count={}", upstream_pools.len()));
+    for pool in &upstream_pools {
+        lines.push(format!(
+            "upstream.pool handler={} transport={} cached_keys={}",
+            pool.handler,
+            pool.transport,
+            pool.cached_keys.join(",")
+        ));
     }
     let state = AgentRuntimeState {
         sessions: sessions.clone(),
@@ -164,6 +349,9 @@ pub async fn write_status_snapshot(
         streams,
         local_services,
         relay_links,
+        config: config.clone(),
+        upstream_pools,
+        recent_errors,
     };
     let path = runtime_status_snapshot_path(data_dir);
     let payload = serde_json::to_vec_pretty(&snapshot)
@@ -178,6 +366,7 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
     )];
     match scope {
         StatusScope::All => {
+            lines.extend(snapshot.config.summary_lines());
             lines.push(format!("session.count={}", snapshot.sessions.len()));
             for session in &snapshot.sessions {
                 lines.push(format!(
@@ -204,7 +393,7 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     .collect::<Vec<_>>()
                     .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={} last_success={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
@@ -213,7 +402,11 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     route.capabilities.join(","),
                     route.learned_from,
                     route.selection_reason,
-                    route.learned_at_unix
+                    route.learned_at_unix,
+                    route
+                        .last_success_at_unix
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
                 ));
             }
             lines.push(format!("registry.stream_count={}", snapshot.streams.len()));
@@ -239,6 +432,25 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
             lines.push(format!("relay.link_count={}", snapshot.relay_links.len()));
             for link in &snapshot.relay_links {
                 lines.push(link.summary_line());
+            }
+            lines.push(format!(
+                "upstream.pool_count={}",
+                snapshot.upstream_pools.len()
+            ));
+            for pool in &snapshot.upstream_pools {
+                lines.push(format!(
+                    "upstream.pool handler={} transport={} cached_keys={}",
+                    pool.handler,
+                    pool.transport,
+                    pool.cached_keys.join(",")
+                ));
+            }
+            lines.push(format!(
+                "recent.error_count={}",
+                snapshot.recent_errors.len()
+            ));
+            for entry in &snapshot.recent_errors {
+                lines.push(entry.summary_line());
             }
         }
         StatusScope::Peers => {
@@ -270,7 +482,7 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     .collect::<Vec<_>>()
                     .join(">");
                 lines.push(format!(
-                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={}",
+                    "registry.route={} next_hop={} hops={} path={} services={} capabilities={} learned_from={} selected_by={} learned_at={} last_success={}",
                     route.destination_agent_id,
                     route.next_hop_agent_id,
                     route.hop_count,
@@ -279,7 +491,11 @@ pub fn render_status_lines(snapshot: &RuntimeStatusSnapshot, scope: StatusScope)
                     route.capabilities.join(","),
                     route.learned_from,
                     route.selection_reason,
-                    route.learned_at_unix
+                    route.learned_at_unix,
+                    route
+                        .last_success_at_unix
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string())
                 ));
             }
         }
@@ -348,10 +564,20 @@ pub fn spawn_status_snapshot_task(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
     relay_links: RelayLinkMap,
+    upstream_pools: UpstreamPoolStatusMap,
+    config: RuntimeConfigSummary,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(err) = write_status_snapshot(&data_dir, &hub, &registry, &relay_links).await
+            if let Err(err) = write_status_snapshot(
+                &data_dir,
+                &hub,
+                &registry,
+                &relay_links,
+                &upstream_pools,
+                &config,
+            )
+            .await
             {
                 eprintln!("status.snapshot.error={}", err);
             }
@@ -386,11 +612,14 @@ pub async fn print_status_snapshot(
                 "peer_count": snapshot.peer_count,
                 "route_count": snapshot.route_count,
                 "stream_count": snapshot.stream_count,
+                "config": snapshot.config,
                 "sessions": snapshot.sessions,
                 "peers": snapshot.peers,
                 "routes": snapshot.routes,
                 "streams": snapshot.streams,
                 "relay_links": snapshot.relay_links,
+                "upstream_pools": snapshot.upstream_pools,
+                "recent_errors": snapshot.recent_errors,
             }),
             StatusScope::Peers => serde_json::json!({
                 "generated_at_unix": snapshot.generated_at_unix,
@@ -418,6 +647,74 @@ pub async fn print_status_snapshot(
         println!("{line}");
     }
     Ok(())
+}
+
+pub fn filter_status_snapshot_json(
+    snapshot: &RuntimeStatusSnapshot,
+    scope: StatusScope,
+) -> Result<String, Error> {
+    let filtered = match scope {
+        StatusScope::All => serde_json::json!({
+            "generated_at_unix": snapshot.generated_at_unix,
+            "session_count": snapshot.sessions.len(),
+            "peer_count": snapshot.peer_count,
+            "route_count": snapshot.route_count,
+            "stream_count": snapshot.stream_count,
+            "config": snapshot.config,
+            "sessions": snapshot.sessions,
+            "peers": snapshot.peers,
+            "routes": snapshot.routes,
+            "streams": snapshot.streams,
+            "relay_links": snapshot.relay_links,
+            "upstream_pools": snapshot.upstream_pools,
+            "recent_errors": snapshot.recent_errors,
+        }),
+        StatusScope::Peers => serde_json::json!({
+            "generated_at_unix": snapshot.generated_at_unix,
+            "sessions": snapshot.sessions,
+            "peers": snapshot.peers,
+        }),
+        StatusScope::Routes => serde_json::json!({
+            "generated_at_unix": snapshot.generated_at_unix,
+            "routes": snapshot.routes,
+        }),
+        StatusScope::Streams => serde_json::json!({
+            "generated_at_unix": snapshot.generated_at_unix,
+            "streams": snapshot.streams,
+            "relay_links": snapshot.relay_links,
+        }),
+    };
+    serde_json::to_string(&filtered).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
+}
+
+pub fn read_status_json(data_dir: &PathBuf, scope: StatusScope) -> Result<String, Error> {
+    let path = runtime_status_snapshot_path(data_dir);
+    let payload = std::fs::read(&path).map_err(|err| {
+        Error::new(
+            err.kind(),
+            format!(
+                "failed to read runtime status snapshot {}: {}",
+                path.display(),
+                err
+            ),
+        )
+    })?;
+    let snapshot: RuntimeStatusSnapshot = serde_json::from_slice(&payload)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    filter_status_snapshot_json(&snapshot, scope)
+}
+
+pub async fn refresh_status_json(
+    data_dir: &PathBuf,
+    hub: &Arc<Mutex<SessionHub>>,
+    registry: &Arc<Mutex<AgentRegistry>>,
+    relay_links: &RelayLinkMap,
+    upstream_pools: &UpstreamPoolStatusMap,
+    config: &RuntimeConfigSummary,
+    scope: StatusScope,
+) -> Result<String, Error> {
+    write_status_snapshot(data_dir, hub, registry, relay_links, upstream_pools, config).await?;
+    read_status_json(data_dir, scope)
 }
 
 pub async fn print_control_snapshot(
@@ -596,4 +893,119 @@ pub async fn print_control_snapshot(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::config::StatusScope,
+        error::{
+            clear_recent_errors_for_tests, recent_error_test_guard, recent_errors_snapshot,
+            record_error, ErrorCode,
+        },
+    };
+
+    #[test]
+    fn render_status_lines_includes_upstream_pools_and_connect_config() {
+        let snapshot = RuntimeStatusSnapshot {
+            generated_at_unix: 1,
+            lines: Vec::new(),
+            peer_count: 0,
+            route_count: 0,
+            stream_count: 0,
+            sessions: Vec::new(),
+            peers: Vec::new(),
+            routes: Vec::new(),
+            streams: Vec::new(),
+            local_services: Vec::new(),
+            relay_links: Vec::new(),
+            upstream_pools: vec![UpstreamPoolEntryStatus {
+                handler: "socks5".into(),
+                transport: "tcp_mux".into(),
+                cached_keys: vec!["tcp://127.0.0.1:34996".into()],
+            }],
+            config: RuntimeConfigSummary {
+                wrapper_compress: false,
+                wrapper_padding: None,
+                shared_key_configured: false,
+                upstream: UpstreamConfigSummary {
+                    conn_policy: "Fallback".into(),
+                    connect_urls: vec!["tcp://127.0.0.1:34996".into()],
+                    up_connect_urls: Vec::new(),
+                    down_connect_urls: Vec::new(),
+                    proxy_chain_count: 1,
+                    front_proxy_configured: true,
+                },
+                tls: Default::default(),
+            },
+            recent_errors: Vec::new(),
+        };
+        let lines = render_status_lines(&snapshot, StatusScope::All);
+        let joined = lines.join("\n");
+        assert!(joined.contains("config.conn_policy=Fallback"));
+        assert!(joined.contains("config.connect=tcp://127.0.0.1:34996"));
+        assert!(joined.contains("upstream.pool_count=1"));
+        assert!(joined.contains("handler=socks5 transport=tcp_mux"));
+    }
+
+    #[tokio::test]
+    async fn publish_upstream_pool_status_updates_existing_entry() {
+        let status: UpstreamPoolStatusMap = Arc::new(Mutex::new(Vec::new()));
+        publish_upstream_pool_status(
+            &status,
+            "http",
+            "ws_mux",
+            vec!["ws://127.0.0.1:1/tunnel".into()],
+        )
+        .await;
+        publish_upstream_pool_status(
+            &status,
+            "http",
+            "ws_mux",
+            vec![
+                "ws://127.0.0.1:1/tunnel".into(),
+                "ws://127.0.0.1:2/tunnel".into(),
+            ],
+        )
+        .await;
+        let guard = status.lock().await;
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].cached_keys.len(), 2);
+    }
+
+    #[test]
+    fn render_status_lines_includes_config_and_recent_errors() {
+        let _guard = recent_error_test_guard();
+        clear_recent_errors_for_tests();
+        record_error(ErrorCode::RouteNoRoute, "missing route", false, None, None);
+        let snapshot = RuntimeStatusSnapshot {
+            generated_at_unix: 1,
+            lines: Vec::new(),
+            peer_count: 0,
+            route_count: 0,
+            stream_count: 0,
+            sessions: Vec::new(),
+            peers: Vec::new(),
+            routes: Vec::new(),
+            streams: Vec::new(),
+            local_services: Vec::new(),
+            relay_links: Vec::new(),
+            upstream_pools: Vec::new(),
+            config: RuntimeConfigSummary {
+                wrapper_compress: true,
+                wrapper_padding: Some(32),
+                shared_key_configured: true,
+                ..RuntimeConfigSummary::default()
+            },
+            recent_errors: recent_errors_snapshot(),
+        };
+        let lines = render_status_lines(&snapshot, StatusScope::All);
+        let joined = lines.join("\n");
+        assert!(joined.contains("config.wrapper.compress=true"));
+        assert!(joined.contains("config.wrapper.padding=32"));
+        assert!(joined.contains("config.shared_key=configured"));
+        assert!(joined.contains("recent.error_count=1"));
+        assert!(joined.contains("route.no_route"));
+    }
 }

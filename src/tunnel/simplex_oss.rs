@@ -107,7 +107,10 @@ pub async fn accept_peer_on(
     let hello = placeholder.read_frame().await?;
     let session = complete_session(&identity, &hello)?;
     let ack = hello_ack_frame(&identity, Some(session.remote.agent_id.clone()));
-    let peer = ActiveSimplexOssPeer { session, ..placeholder };
+    let peer = ActiveSimplexOssPeer {
+        session,
+        ..placeholder
+    };
     peer.send_frame(&ack).await?;
 
     let heartbeat = peer.read_frame().await?;
@@ -238,10 +241,7 @@ mod tests {
             "fusion-simplex-oss-test-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let endpoint = format!(
-            "simplex+oss://demo/channel?root={}",
-            root.display()
-        );
+        let endpoint = format!("simplex+oss://demo/channel?root={}", root.display());
         let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
             name: Some("simplex-oss-server".into()),
             key: None,
@@ -260,10 +260,7 @@ mod tests {
             }
         });
 
-        let endpoint = format!(
-            "simplex+oss://demo/channel?root={}",
-            root.display()
-        );
+        let endpoint = format!("simplex+oss://demo/channel?root={}", root.display());
         let peer = connect_peer(client_identity, &endpoint).await.unwrap();
         let frame = Frame::new(
             MessageType::TaskRequest,

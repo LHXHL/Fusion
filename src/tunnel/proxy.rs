@@ -95,9 +95,7 @@ pub async fn connect_via_proxy_chain(
         };
         match proxy {
             ProxyEndpoint::Socks5 {
-                username,
-                password,
-                ..
+                username, password, ..
             } => {
                 establish_socks5_tunnel(
                     &mut stream,
@@ -109,9 +107,7 @@ pub async fn connect_via_proxy_chain(
                 .await?
             }
             ProxyEndpoint::Http {
-                username,
-                password,
-                ..
+                username, password, ..
             } => {
                 establish_http_connect_tunnel(
                     &mut stream,
@@ -360,8 +356,7 @@ mod tests {
     #[test]
     fn parses_proxy_endpoint_with_auth() {
         assert!(matches!(
-            ProxyEndpoint::parse("socks5://127.0.0.1:1080?username=demo&password=secret")
-                .unwrap(),
+            ProxyEndpoint::parse("socks5://127.0.0.1:1080?username=demo&password=secret").unwrap(),
             ProxyEndpoint::Socks5 {
                 username: Some(_),
                 password: Some(_),
@@ -369,8 +364,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            ProxyEndpoint::parse("http://127.0.0.1:8080?username=demo&password=secret")
-                .unwrap(),
+            ProxyEndpoint::parse("http://127.0.0.1:8080?username=demo&password=secret").unwrap(),
             ProxyEndpoint::Http {
                 username: Some(_),
                 password: Some(_),
@@ -467,10 +461,7 @@ mod tests {
             "127.0.0.1",
             target_addr.port(),
             &[
-                format!(
-                    "http://{}?username=demo&password=secret",
-                    http_proxy_addr
-                ),
+                format!("http://{}?username=demo&password=secret", http_proxy_addr),
                 format!(
                     "socks5://{}?username=demo&password=secret",
                     socks_proxy_addr

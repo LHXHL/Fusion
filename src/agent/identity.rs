@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::utils::random::random_name;
-use crate::{agent::capabilities::CapabilityRegistry, app::config::AgentIdentityConfig};
+use crate::{
+    agent::capabilities::CapabilityRegistry, app::config::AgentIdentityConfig,
+    crypto::wrapper::global_wrapper_config,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AgentIdentity {
@@ -32,7 +35,18 @@ impl AgentIdentity {
     }
 
     pub fn capability_labels(&self) -> Vec<String> {
-        CapabilityRegistry::default_for_platform(&self.os, &self.arch).labels()
+        let mut labels = CapabilityRegistry::default_for_platform(&self.os, &self.arch).labels();
+        if self.shared_key.is_some() {
+            labels.push("wrapper:shared-key".to_string());
+        }
+        let wrapper = global_wrapper_config();
+        if wrapper.compress {
+            labels.push("wrapper:compress".to_string());
+        }
+        if let Some(bytes) = wrapper.padding {
+            labels.push(format!("wrapper:padding:{bytes}"));
+        }
+        labels
     }
 
     pub fn shared_key_secret(&self) -> Option<&str> {
@@ -106,5 +120,15 @@ mod tests {
         });
 
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn capability_labels_include_shared_key_wrapper() {
+        let identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("node-wrapper".to_string()),
+            key: Some("secret".to_string()),
+        });
+        let labels = identity.capability_labels();
+        assert!(labels.iter().any(|label| label == "wrapper:shared-key"));
     }
 }

@@ -68,6 +68,9 @@ service.exposed_count=1
 ## 已实现能力
 
 ### Tunnel
+
+**基础链路**
+
 - `tcp://`
 - `ws://`
 - `wss://`（支持显式 TLS 证书/私钥配置）
@@ -76,6 +79,15 @@ service.exposed_count=1
 - `memory://`（当前为同进程/嵌入模式 transport）
 - `icmp://`（当前为 sandbox 下的 datagram transport 实现）
 - `wg://`（当前为 sandbox 下的 datagram transport 实现）
+
+**Simplex / HTTP/2 / DNS（Phase K 已交付）**
+
+- `simplex+http://` — HTTP/1.1 分片 + SR-ARQ + mux/relay
+- `simplex+dns://` / `dns://` — UDP DNS 查询信道（`dns://` 为别名）
+- `simplex+oss://` — 对象存储轮询信道
+- `h2://` / `h2s://` — HTTP/2 mux 隧道（task / raw / relay；K3 控制/数据面拆分，详见 [`docs/h2-transport.md`](docs/h2-transport.md)）
+
+Simplex 系列说明见 [`docs/simplex-transport.md`](docs/simplex-transport.md)。
 
 ### Service
 - `socks5://HOST:PORT`
@@ -101,7 +113,7 @@ service.exposed_count=1
 
 ### 传输加密
 - `-k, --key <SECRET>`
-  - 对 `tcp://` / `ws://` / `wss://` 链路上的 **统一协议帧** 做预共享密钥加密
+  - 对 Fusion **统一协议帧** 做预共享密钥加密（适用 `tcp` / `ws` / `wss` / `h2` / `simplex` 等已接入 transport）
 - 当前为**预共享密钥模式**
 - 双端必须配置相同密钥，否则握手失败
 
@@ -111,13 +123,18 @@ service.exposed_count=1
   - `rlib`
   - `cdylib`
   - `staticlib`
-- 已导出基础 C ABI：
-  - `fusion_abi_version`
-  - `fusion_version_string`
-  - `fusion_parse_url_json`
-  - `fusion_string_free`
-- C 头文件：
-  - `/Users/qi4l/lang/Rust/Fusion-master/include/fusion.h`
+- C ABI 版本：**2**（`fusion_abi_version()`）
+- 已导出 C ABI：
+  - `fusion_abi_version` / `fusion_version_string`
+  - `fusion_parse_url_json` / `fusion_string_free`
+  - `fusion_last_error` / `fusion_clear_last_error`
+  - `fusion_runtime_create` / `fusion_runtime_destroy`
+  - `fusion_runtime_load_config_file` / `fusion_runtime_start` / `fusion_runtime_stop`
+  - `fusion_runtime_status_json` / `fusion_runtime_task_request_json`
+- C 头文件：[`include/fusion.h`](include/fusion.h)
+- 嵌入指南：[`docs/embedding.md`](docs/embedding.md)
+- 示例：[`examples/c_host`](examples/c_host) / [`examples/python_host`](examples/python_host)
+- WASM W1 纯逻辑包：[`crates/fusion-logic`](crates/fusion-logic)、[`docs/embedding.md`](docs/embedding.md)、[`docs/release.md`](docs/release.md)
 
 ### Phase 6 基础能力
 - `src/tunnel/simplex.rs`
@@ -136,7 +153,33 @@ service.exposed_count=1
   - 已接入最小 batch envelope / long-poll receive
   - 已接入重复包抑制（retransmit dedup）
   - 已覆盖基础 frame exchange
-  - 暂未接入 mux / relay / `simplex+dns://` / `simplex+oss://`
+  - 已接入 mux / relay / task / raw service
+  - `simplex+dns://` / `dns://` / `simplex+oss://` 已交付（详见 [`docs/simplex-transport.md`](docs/simplex-transport.md)）
+  - `h2://` / `h2s://` HTTP/2 mux 隧道已交付（Phase K3：client `StreamData` 独立 h2 stream，server/relay 回程走 control；单跳 / 3 / 5 / 10 跳 relay 回归通过，详见 [`docs/h2-transport.md`](docs/h2-transport.md)）
+
+---
+
+### H2 / DNS 隧道
+
+`h2://` cleartext HTTP/2（h2c）；`h2s://` 为 TLS + ALPN `h2`，query 参数与 `wss://` 相同。
+
+终端 A：
+
+```bash
+cargo run --bin fusion -- \
+  -s h2://0.0.0.0:39200/tunnel \
+  -a h2-server
+```
+
+终端 B：
+
+```bash
+cargo run --bin fusion -- \
+  -c h2://127.0.0.1:39200/tunnel \
+  -a h2-client
+```
+
+`dns://` 与 `simplex+dns://` 等价，适合经 DNS 查询/响应承载 Fusion 帧；示例见 [`docs/simplex-transport.md`](docs/simplex-transport.md) 与 `fusion.toml.example` 中的 DNS profile。
 
 ---
 
@@ -178,6 +221,8 @@ cargo run --bin fusion -- \
   -s tcp://0.0.0.0:35000 \
   -a relay
 ```
+
+`h2://` / `dns://` / `simplex+http://` 等多跳 relay 用法相同，仅替换 tunnel URL；见 [`docs/relay.md`](docs/relay.md)。
 
 ### socks5 -> raw
 
@@ -221,7 +266,7 @@ cargo run --bin fusion -- \
   -a http-entry
 ```
 
-### Shadowsocks(minimal) -> raw
+### Shadowsocks -> raw
 
 出口节点：
 
@@ -243,9 +288,9 @@ cargo run --bin fusion -- \
 ```
 
 说明：
-- 当前为 **最小版 Shadowsocks service**
-- 仅支持 TCP 请求头解析与转发
-- 当前仅支持 `method=none`，用于先打通 service/runtime 主链路
+- 当前支持 `method=none` 与 `method=aes-256-gcm-siv&password=...`
+- `aes-256-gcm-siv` 为 Fusion AEAD 请求帧，用于保护首个 Shadowsocks 地址请求
+- 当前仍不支持 UDP associate，也不承诺与完整 Shadowsocks 生态逐字节兼容
 
 ### 固定端口转发
 
@@ -339,6 +384,8 @@ cargo run --bin fusion -- --config ./fusion.toml
 - `tcp://`
 - `ws://`
 - `wss://`
+- `h2://` / `h2s://`
+- `simplex+http://` / `simplex+dns://` / `dns://` / `simplex+oss://`
 
 示例：
 
@@ -388,31 +435,48 @@ cargo run --bin fusion -- \
   - 上游池在复用前会检查 `SessionHub` / `AgentRegistry` 中的 peer 状态，避免继续复用已关闭连接
   - 上游池现已带周期性清理任务，会定期回收 hub/registry 中已经失活的 peer
   - 更深层的 route/session 感知型热切换仍可继续增强
-- `simplex+http://` 当前已不止于基础帧交换：
-  - 已可承载 direct task 请求链路
-  - mux / relay / `simplex+dns://` / `simplex+oss://` 仍待继续扩展
-- `simplex+dns://` / `simplex+oss://` 与 WASM 仍未完成
-- `src/crypto/wrapper.rs` / `src/utils/fs.rs`：本轮明确不补空壳文件
-- 当前协议错误传播未形成统一错误码体系
+- Simplex 系列（`simplex+http` / `simplex+dns` / `dns` / `simplex+oss`）与 `h2://` / `h2s://` 已可承载 direct task、mux、raw service 与 relay（含 3/5/10 跳 stream bridge）；边界见 [`docs/simplex-transport.md`](docs/simplex-transport.md)、[`docs/h2-transport.md`](docs/h2-transport.md)
+- WASM 完整 runtime 仍未完成；**W1 纯逻辑 API 已交付**（URL/config/status），见 [`docs/embedding.md`](docs/embedding.md)、[`docs/release.md`](docs/release.md)
+- 统一错误码见 [`src/error.rs`](src/error.rs)；service/task 层覆盖仍待扩展
 
 ---
 
 ## 验收与回归
 
 ```bash
-cargo test
-bash scripts/regression/manual-smoke.sh
+cargo test --lib
 ```
+
+当前 lib 回归约 **229** 项（含 h2 mux 单元与 h2 relay 单跳 / 3 / 5 / 10 跳）。索引见 [`docs/test-matrix.md`](docs/test-matrix.md)。
 
 ---
 
 ## 文档索引
 
-- `docs/quick-start.md`
-- `docs/relay.md`
-- `docs/socks5-and-raw.md`
-- `docs/task.md`
-- `docs/protocol.md`
-- `docs/baseline-current-capabilities.md`
-- `docs/test-matrix.md`
-- `docs/plan-alignment.md`
+**上手与能力**
+
+- [`docs/quick-start.md`](docs/quick-start.md) — CLI 快速上手
+- [`docs/baseline-current-capabilities.md`](docs/baseline-current-capabilities.md) — 当前能力基线
+- [`docs/development-plan.md`](docs/development-plan.md) — 开发规划与 rem 设计对照
+- [`docs/test-matrix.md`](docs/test-matrix.md) — 回归测试矩阵
+
+**协议与服务**
+
+- [`docs/protocol.md`](docs/protocol.md) — 统一 Agent 协议
+- [`docs/relay.md`](docs/relay.md) — 多跳 relay 示例
+- [`docs/socks5-and-raw.md`](docs/socks5-and-raw.md) — socks5 / raw / port 服务
+
+**传输专题**
+
+- [`docs/simplex-transport.md`](docs/simplex-transport.md)
+- [`docs/http-transport.md`](docs/http-transport.md)
+- [`docs/h2-transport.md`](docs/h2-transport.md) — `h2://` / `h2s://` 交付说明
+- [`docs/h2-dns-transport-plan.md`](docs/h2-dns-transport-plan.md) — Phase K 设计与实施记录
+- [`docs/tls-transport.md`](docs/tls-transport.md)
+- [`docs/trojan-transport.md`](docs/trojan-transport.md)
+
+**嵌入与发布**
+
+- [`docs/embedding.md`](docs/embedding.md) — C ABI、memory 隧道、WASM 边界
+- [`docs/abi-stability.md`](docs/abi-stability.md) — ABI 版本策略
+- [`docs/release.md`](docs/release.md) — 构建、CI、发布清单

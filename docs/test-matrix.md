@@ -1,107 +1,156 @@
-# Fusion 测试矩阵（按项目计划阶段映射）
+# Fusion 回归测试矩阵
 
-## Phase 0
+本文档将主要能力与 `cargo test --lib` 入口对应，便于按领域回归。
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| 基线文档存在 | `docs/baseline-current-capabilities.md` | 已覆盖 |
-| smoke 脚本存在 | `scripts/regression/manual-smoke.sh` | 已覆盖 |
+运行全部库测试：
 
-## Phase 1
+```bash
+cargo test --lib
+```
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| `fusion --help` 可用 | `cargo run --bin fusion -- --help` | 已覆盖 |
-| URL 解析可用 | `src/utils/url.rs` 单元测试 | 已覆盖 |
-| `-k` 预共享密钥帧封装 | `src/crypto/transport.rs` 测试 | 已覆盖 |
-| smoke 回归入口 | `scripts/regression/manual-smoke.sh` | 已覆盖 |
+按模块过滤示例：
 
-## Phase 2
+```bash
+cargo test --lib app::runtime_tests::
+cargo test --lib app::upstream_pool::
+cargo test --lib agent::registry::
+```
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| crypto 抽离 | `src/crypto/aead.rs` / `src/crypto/kex.rs` | 已覆盖 |
-| identity 抽离 | `src/agent/identity.rs` 测试 | 已覆盖 |
-| task capability 抽离 | `src/task/*` + `src/task/dispatcher.rs` 测试 | 已覆盖 |
-| runtime task artifact 抽离 | `src/app/runtime_task.rs` 测试 | 已覆盖 |
+---
 
-## Phase 3
+## 1. CLI 与配置
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| hello / heartbeat / task echo | `src/tunnel/tcp.rs`、`src/tunnel/ws.rs`、`src/task/dispatcher.rs` 测试 | 已覆盖 |
-| keyed hello / frame exchange | `tcp_peer_can_exchange_frames_with_shared_key` / `ws_peer_can_exchange_frames_with_shared_key` | 已覆盖 |
-| frame codec roundtrip | `src/protocol/codec.rs` 测试 | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| 参数解析 / status 子命令 | `app::cli::tests::parse_*` |
+| Phase 5 connect / wrapper 选项 | `app::cli::tests::parse_phase5_connect_options`, `parse_wrapper_options` |
+| up-/down- URL 前缀 | `app::config::tests::merge_connect_endpoints`, `parse_tunnel_endpoint_strips_up_and_down_prefixes` |
+| runtime bootstrap | `app::runtime_bootstrap::tests::*` |
+| conn hub / conn policy | `app::conn_hub::tests::*` |
 
-## Phase 4
+## 2. Route 与 Relay
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| PeerSession / SessionHub | `src/session/peer.rs` / `src/session/hub.rs` | 已覆盖 |
-| reconnect 退避策略 | `src/session/reconnect.rs` 测试 | 已覆盖 |
-| runtime status/control 抽离 | `src/app/runtime_status.rs` | 已覆盖 |
-| runtime relay/announce 抽离 | `src/app/runtime_relay.rs` + relay runtime tests | 已覆盖 |
-| listener/connect 模式分流抽离 | `src/app/runtime_mode.rs` 测试 | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| route 生命周期 / 选优 / 收敛 | `agent::registry::tests::*` |
+| route 校验 / path 保留 | `app::runtime_relay::tests::*` |
+| TCP 3/5/10 跳 relay | `app::runtime_tests::tcp_relay_stream_bridge_roundtrip_through_*` |
+| WS relay | `app::runtime_tests::ws_relay_stream_bridge_roundtrip` |
+| **h2 relay 3/5/10 跳** | `app::runtime_tests::h2_relay_stream_bridge_roundtrip*` |
+| **dns relay 3-hop** | `app::runtime_tests::dns_relay_stream_bridge_roundtrip_through_three_hops` |
+| Simplex HTTP/DNS/OSS 3/5/10 跳 relay | `app::runtime_tests::simplex_*_relay_stream_bridge_roundtrip_through_*` |
+| socks5/http over relay | `app::runtime_tests::tcp_socks5_over_relay_roundtrip`, `tcp_http_proxy_over_relay_roundtrip`, `ws_*_over_relay_roundtrip` |
+| socks5 over Simplex HTTP | `app::runtime_tests::simplex_http_socks5_over_raw_roundtrip` |
+| port forward over Simplex HTTP | `app::runtime_tests::simplex_http_port_forward_over_raw_roundtrip` |
+| trojan over mux → raw | `app::runtime_tests::tcp_trojan_over_raw_roundtrip` |
+| Trojan 协议解析 | `serve::trojan::tests::*` |
 
-## Phase 5
+## 3. Upstream 连接池与 Failover
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| TCP tunnel | `src/tunnel/tcp.rs` / `src/tunnel/tcp_mux.rs` 测试 | 已覆盖 |
-| WS tunnel | `src/tunnel/ws.rs` / `src/tunnel/ws_mux.rs` 测试 | 已覆盖 |
-| WSS tunnel | `wss_mux_handshake_and_stream_roundtrip_with_insecure_client` + `src/tunnel/tls.rs` 测试 | 已覆盖 |
-| UDP tunnel | `src/tunnel/udp.rs` + smoke 中的 UDP 互连 | 已覆盖 |
-| Unix tunnel | `src/tunnel/unix.rs` 测试 | 已覆盖 |
-| Memory tunnel | `src/tunnel/memory.rs` 测试 | 已覆盖 |
-| icmp / wg sandbox tunnel | `src/tunnel/dialer.rs` / `src/tunnel/listener.rs` / `src/app/runtime_mode.rs` 测试 | 已覆盖 |
-| HTTP CONNECT proxy chain | `src/tunnel/proxy.rs` 测试 | 已覆盖 |
-| keyed mux | `mux_peer_routes_frames_by_stream_id_with_shared_key` | 已覆盖 |
-| listener / dialer 抽象 | `src/tunnel/listener.rs` / `src/tunnel/dialer.rs` | 已覆盖 |
-| Conn policy / up-down pool parsing | `src/app/cli.rs` + `src/app/conn_hub.rs` 测试 | 已覆盖 |
-| 服务级上游择路 | `src/app/runtime_socks5.rs` / `src/app/runtime_http.rs` 编排 + smoke 主链路 | 已覆盖 |
-| 上游 mux 连接复用 | `src/app/upstream_pool.rs` 测试 | 已覆盖 |
-| 复用连接失效剔除 | `src/app/runtime_socks5.rs` / `src/app/runtime_http.rs` failover 编排 | 已覆盖 |
-| 复用前活性校验 | `src/app/upstream_pool.rs` stale peer 测试 | 已覆盖 |
-| 周期性后台清理 | `src/app/upstream_pool.rs` prune stale 测试 + runtime 维护任务 | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| mux peer 复用 | `app::upstream_pool::tests::tcp_upstream_pool_reuses_existing_mux_peer` |
+| stale peer 剔除 | `app::upstream_pool::tests::tcp_upstream_pool_drops_stale_peer_before_reuse` |
+| 后台 prune | `app::upstream_pool::tests::tcp_upstream_pool_prune_stale_removes_closed_entries` |
+| endpoint failover | `app::upstream_pool::tests::tcp_upstream_pool_failover_skips_unreachable_endpoint` |
+| round-robin 择路 | `app::upstream_pool::tests::tcp_upstream_pool_round_robin_policy_acquires_successfully` |
+| task 多上游 failover | `app::runtime_tests::outbound_task_fails_over_to_second_tcp_endpoint` |
 
-## Phase 6
+## 4. Simplex Transport
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| socks5 -> raw | `tcp_socks5_over_relay_roundtrip` / `ws_socks5_over_relay_roundtrip` | 已覆盖 |
-| http proxy -> raw | `tcp_http_proxy_over_relay_roundtrip` / `ws_http_connect_over_relay_roundtrip` + smoke | 已覆盖 |
-| `port://...->...` 解析与转发 | `src/serve/portfwd.rs` 测试 | 已覆盖 |
-| WSS mTLS 握手与流转发 | `wss_mux_handshake_and_stream_roundtrip_with_mutual_tls` | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| HTTP direct task | `app::runtime_tests::outbound_task_over_simplex_http_endpoint_succeeds` |
+| **`http://` 长轮询 task** | `app::runtime_tests::outbound_task_over_http_endpoint_succeeds` |
+| **`streamhttp://` SSE task** | `app::runtime_tests::outbound_task_over_streamhttp_endpoint_succeeds`, `tunnel::streamhttp::tests::streamhttp_task_roundtrip` |
+| DNS direct task | `app::runtime_tests::outbound_task_over_simplex_dns_endpoint_succeeds`, `outbound_task_over_dns_endpoint_succeeds` |
+| OSS direct task | `app::runtime_tests::outbound_task_over_simplex_oss_endpoint_succeeds` |
+| HTTP inbound session | `app::runtime_tests::simplex_http_inbound_runtime_registers_direct_session` |
+| OSS inbound session | `app::runtime_tests::simplex_oss_inbound_runtime_registers_direct_session` |
+| SR-ARQ / mux 单元 | `tunnel::simplex::tests::*`, `tunnel::simplex_http_mux::tests::*`, `tunnel::simplex_dns_mux::tests::*`, `tunnel::simplex_oss_mux::tests::*` |
 
-## Phase 7
+边界说明见 [`simplex-transport.md`](simplex-transport.md)。`http://` / `streamhttp://` 见 [`http-transport.md`](http-transport.md)。
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| task shell/screenshot/file | `src/task/dispatcher.rs` + runtime task 路径 | 已覆盖 |
+## 4.1 HTTP/2 与 DNS 别名（Phase K）
 
-## Phase 8
+| 能力 | 测试 |
+|------|------|
+| `dns://` URL 解析 | `app::config::tests::parse_dns_tunnel_url` |
+| `dns://` direct task | `app::runtime_tests::outbound_task_over_dns_endpoint_succeeds` |
+| `h2://` URL 解析 | `app::config::tests::parse_h2_tunnel_url` |
+| `h2://` direct task | `app::runtime_tests::outbound_task_over_h2_endpoint_succeeds` |
+| h2 mux 单元 | `tunnel::h2_mux::tests::*`（含 `h2_mux_uses_separate_data_streams_for_concurrent_ids`） |
+| h2 relay 单跳 / 3/5/10 跳 | `app::runtime_tests::h2_relay_stream_bridge_roundtrip*` |
+| h2s TLS / mTLS | `tunnel::h2_mux::tests::h2s_handshake_*`, `tunnel::tls::tests::h2s_*` |
+| dns relay 3-hop（`dns://`） | `app::runtime_tests::dns_relay_stream_bridge_roundtrip_through_three_hops` |
+| fusion-logic URL | `cargo test -p fusion-logic url::tests::parse_dns_tunnel_url`, `parse_h2_tunnel_urls` |
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| relay 基础转发 | `tcp_relay_stream_bridge_roundtrip` / `ws_relay_stream_bridge_roundtrip` | 已覆盖 |
-| route registry | `src/agent/registry.rs` / `src/session/router.rs` 测试 | 已覆盖 |
+详见 [`h2-transport.md`](h2-transport.md)。
 
-## Phase 9
+## 5. Tunnel 与会话
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| peers/routes/services/task 控制面 | `fusion` CLI 子命令 | 已覆盖 |
-| 本地状态视图 | `runtime-status.json` + `status` 命令 | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| TCP / WS / WSS mux | `tunnel::tcp_mux::tests::*`, `tunnel::ws_mux::tests::*` |
+| TLS 参数面 | `tunnel::tls::tests::*` |
+| UDP / Unix / Memory | `tunnel::udp::tests::*`, `tunnel::unix::tests::*`, `tunnel::memory::tests::*` |
+| listener 绑定 | `tunnel::listener::tests::*` |
+| UDP inbound runtime | `app::runtime_tests::udp_inbound_runtime_registers_direct_session` |
 
-## Phase 10
+## 6. 加密与 Wrapper
 
-| 验收点 | 当前证据 | 状态 |
-|---|---|---|
-| 单一二进制 | `src/bin/fusion.rs` | 已覆盖 |
-| C ABI 基础导出 | `src/ffi.rs` 测试 + `cargo build --lib` | 已覆盖 |
-| simplex / SR-ARQ 基础层 | `src/tunnel/simplex.rs` + `src/tunnel/simplex_http.rs`（握手 / 分片 / ACK重传 / 窗口发送 / batch send-receive / dedup / frame exchange）测试 | 已覆盖 |
-| simplex+http direct task | `outbound_task_over_simplex_http_endpoint_succeeds` | 已覆盖 |
-| 认证代理链 | `connects_via_authenticated_http_and_socks5_proxy_chain` | 已覆盖 |
-| task 多端点 failover | `outbound_task_fails_over_to_second_tcp_endpoint` | 已覆盖 |
-| wrapper pipeline 多 stage 基础层 | `src/crypto/wrapper.rs` / `src/crypto/transport.rs`（compression / padding / AEAD 组合）测试 | 已覆盖 |
-| 文档面向单体 Agent | README + docs | 已覆盖 |
+| 能力 | 测试 |
+|------|------|
+| AEAD / KEX | `crypto::aead::tests::*`, `crypto::kex::tests::*` |
+| transport frame | `crypto::transport::tests::*` |
+| wrapper pipeline | `crypto::wrapper::tests::*` |
+
+## 7. Serve 层
+
+| 能力 | 测试 |
+|------|------|
+| SOCKS5 解析 / 认证 | `serve::socks5::tests::*` |
+| HTTP proxy 解析 | `serve::http::tests::*` |
+| Shadowsocks `none` / AEAD 请求帧 | `serve::shadowsocks::tests::*` |
+| raw / port forward | `serve::raw::tests::*`, `serve::portfwd::tests::*` |
+
+## 8. Task
+
+| 能力 | 测试 |
+|------|------|
+| artifact 落盘 | `app::runtime_task::tests::*` |
+| task save 路径 | `app::runtime_tests::task_artifact_save_path_override_is_used` |
+
+## 9. 可观测性与 Status
+
+| 能力 | 测试 |
+|------|------|
+| status 快照写入 / 过滤 | `app::runtime_tests::status_snapshot_is_written_and_filtered` |
+| config + recent errors 渲染 | `app::runtime_status::tests::render_status_lines_includes_config_and_recent_errors` |
+| TLS 摘要（无 PEM 路径） | `tunnel::tls::tests::summarize_tls_usage_counts_wss_flags_without_paths` |
+| port forward / simplex 模式 | `app::runtime_mode::tests::direct_port_forward_skipped_when_simplex_connect_configured` |
+| route 事件写入 recent errors | `agent::registry::tests::registry_records_route_switch_in_recent_errors` |
+| wrapper capability 标签 | `agent::identity::tests::capability_labels_include_shared_key_wrapper` |
+
+`upstream_pools` 字段由运行时 socks5/http/shadowsocks 上游池在 acquire/invalidate/prune 时写入；可通过 `status --json` 或 `runtime-status.json` 验证。
+
+## 10. 平台化（手动 / 示例）
+
+| 能力 | 验证方式 |
+|------|----------|
+| C ABI v2 | 构建 `cargo build --lib`；运行 `examples/c_host` |
+| Logic API v1 | `cargo test -p fusion-logic`；`ffi::tests::ffi_logic_api_validate_and_filter_work` |
+| WASM W1 | `cargo build -p fusion-logic --target wasm32-unknown-unknown --features wasm` |
+| Python ctypes | 运行 `examples/python_host/demo.py` |
+| 嵌入 API | 见 [`embedding.md`](embedding.md)、[`abi-stability.md`](abi-stability.md) |
+
+库测试不覆盖完整 FFI 生命周期；集成验证依赖上述示例。
+
+---
+
+## 相关文档
+
+- 能力基线：[`baseline-current-capabilities.md`](baseline-current-capabilities.md)
+- 开发规划：[`development-plan.md`](development-plan.md)
+- TLS 边界：[`tls-transport.md`](tls-transport.md)
+- Trojan 边界：[`trojan-transport.md`](trojan-transport.md)

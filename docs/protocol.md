@@ -9,12 +9,12 @@
 - 单帧 JSON 编码/解码
 
 对应实现：
-- `/Users/qi4l/lang/Rust/Fusion-master/src/protocol/codec.rs`
+- [`src/protocol/codec.rs`](../src/protocol/codec.rs)
 
 ## 2. Frame 结构
 
 定义位置：
-- `/Users/qi4l/lang/Rust/Fusion-master/src/protocol/frame.rs`
+- [`src/protocol/frame.rs`](../src/protocol/frame.rs)
 
 ### Header 字段
 - `version`：协议版本，当前固定为 `1`
@@ -52,6 +52,13 @@
 - `Hello`：声明本端 agent_id / agent_name / capabilities / protocol_version
 - `HelloAck`：接受握手并回传 peer_id
 - `Heartbeat`：保持会话存活
+
+Wrapper 相关 capability：
+- `wrapper:shared-key`
+- `wrapper:compress`
+- `wrapper:padding:<BYTES>`
+
+这些标签用于让对端观测本端配置；当前不会自动协商或改写本地 wrapper 配置。
 
 ## 5. 控制消息
 
@@ -131,12 +138,19 @@
 
 ## 9. 错误传播
 
-当前实现中多数错误通过以下方式暴露：
-- 本地 stderr 日志
-- `TaskResult.ok=false`
-- stream close / runtime status snapshot
+当前实现通过 [`src/error.rs`](../src/error.rs) 提供统一错误码：
 
-当前尚未实现统一错误码表。
+- `ErrorCode` 枚举（如 `route.no_route`、`tls.invalid_client_identity`、`wrapper.compression_mismatch`）
+- `FusionError` 结构（code / component / message / retryable / details）
+- recent errors 环形缓冲，写入 `runtime-status.json` 的 `recent_errors` 字段
+
+错误仍会通过以下渠道暴露：
+- 本地 stderr 日志（含 `FusionError` 文案）
+- `TaskResult.ok=false`
+- stream close reason
+- runtime status snapshot / `status --json`
+
+service / task 层尚未全面归一化到 `ErrorCode`。
 
 ## 10. 与目录结构对应关系
 

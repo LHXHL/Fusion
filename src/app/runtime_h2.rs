@@ -1,0 +1,399 @@
+use std::{
+    collections::HashMap,
+    io::{Error, ErrorKind},
+    sync::Arc,
+};
+
+use crate::{
+    agent::{identity::AgentIdentity, registry::AgentRegistry},
+    app::{
+        config::TunnelEndpoint,
+        runtime_relay::{
+            broadcast_control_frame_h2, handle_h2_relay_stream_open,
+            handle_registry_control_message, send_direct_announce_h2_mux,
+            send_route_snapshot_h2_mux, ROUTE_TTL_SECS,
+        },
+        runtime_status::RelayLinkMap,
+    },
+    error::report_route_pruned,
+    protocol::{
+        frame::{Frame, MessageType},
+        message::Message,
+    },
+    session::{
+        hub::SessionHub,
+        router::{decide_frame_route, RouteDecision},
+    },
+    task::dispatcher,
+    tunnel::h2_mux,
+};
+use tokio::{net::TcpListener, sync::Mutex};
+
+pub type H2TaskPeerMap = Arc<Mutex<HashMap<String, h2_mux::MuxH2Peer>>>;
+pub type H2RelayStreamAllocator = Arc<Mutex<u32>>;
+
+pub async fn run_outbound_relay_peer_h2(
+    identity: AgentIdentity,
+    endpoint: &TunnelEndpoint,
+    local_services: Vec<String>,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+    peer_map: H2TaskPeerMap,
+    relay_stream_allocator: H2RelayStreamAllocator,
+    relay_links: RelayLinkMap,
+) -> Result<(), Error> {
+    let peer = h2_mux::connect_mux_peer(identity.clone(), &endpoint.url.original).await?;
+
+    hub.lock().await.upsert(peer.session.clone());
+    registry.lock().await.upsert_peer(peer.session.clone());
+    peer_map
+        .lock()
+        .await
+        .insert(peer.session.remote.agent_id.clone(), peer.clone());
+    println!(
+        "session.outbound.peer={} to={} via=h2",
+        peer.session.remote.agent_id, endpoint.url.original
+    );
+    send_direct_announce_h2_mux(&peer, &identity, &local_services).await?;
+    let route_snapshot = {
+        let mut registry_guard = registry.lock().await;
+        let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
+        if pruned > 0 {
+            report_route_pruned(pruned);
+        }
+        registry_guard.routes_snapshot()
+    };
+    send_route_snapshot_h2_mux(
+        &peer,
+        &identity,
+        &route_snapshot,
+        Some(peer.session.remote.agent_id.clone()),
+    )
+    .await?;
+
+    let stream_peer = peer.clone();
+    let stream_peer_map = peer_map.clone();
+    let stream_allocator = relay_stream_allocator.clone();
+    let stream_relay_links = relay_links.clone();
+    tokio::spawn(async move {
+        loop {
+            let open_frame = match stream_peer.read_stream_open_frame().await {
+                Ok(frame) => frame,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    eprintln!("stream.relay.accept.error={err}");
+                    break;
+                }
+            };
+            if let Err(err) = handle_h2_relay_stream_open(
+                stream_peer_map.clone(),
+                stream_allocator.clone(),
+                stream_relay_links.clone(),
+                stream_peer.clone(),
+                open_frame,
+            )
+            .await
+            {
+                eprintln!("stream.relay.open.error={err}");
+            }
+        }
+    });
+
+    loop {
+        let frame = match peer.read_control_frame().await {
+            Ok(frame) => frame,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err),
+        };
+
+        let handled_control = {
+            let mut registry_guard = registry.lock().await;
+            handle_registry_control_message(
+                &mut registry_guard,
+                &identity.id,
+                &peer.session.remote.agent_id,
+                &frame.message,
+            )
+        };
+        if handled_control {
+            broadcast_control_frame_h2(&peer_map, &identity, &peer.session.remote.agent_id, &frame)
+                .await?;
+            continue;
+        }
+
+        let route_decision = {
+            let mut registry_guard = registry.lock().await;
+            let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
+            if pruned > 0 {
+                report_route_pruned(pruned);
+            }
+            decide_frame_route(&identity.id, &registry_guard, &frame)
+        };
+        match route_decision {
+            RouteDecision::Local => match frame.message {
+                Message::TaskRequest(request) => {
+                    let response_dst = frame
+                        .header
+                        .src_agent
+                        .clone()
+                        .unwrap_or_else(|| peer.session.remote.agent_id.clone());
+                    let result = dispatcher::dispatch(&request).await;
+                    let response = Frame::new(
+                        MessageType::TaskResult,
+                        Some(peer.session.local.agent_id.clone()),
+                        Some(response_dst),
+                        Message::TaskResult(result),
+                    );
+                    peer.send_frame(&response).await?;
+                }
+                other => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("unexpected message on outbound h2 relay peer: {:?}", other),
+                    ))
+                }
+            },
+            RouteDecision::Forward { next_hop_agent_id } => {
+                if next_hop_agent_id == peer.session.remote.agent_id {
+                    eprintln!(
+                        "relay.drop.loop dst={:?} next_hop={} source_peer={}",
+                        frame.header.dst_agent, next_hop_agent_id, peer.session.remote.agent_id
+                    );
+                    continue;
+                }
+                let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
+                if let Some(next_hop) = next_hop {
+                    next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
+                    eprintln!(
+                        "relay.forward.sent dst={:?} next_hop={}",
+                        frame.header.dst_agent, next_hop_agent_id
+                    );
+                } else {
+                    eprintln!(
+                        "relay.forward.missing_next_hop dst={:?} next_hop={}",
+                        frame.header.dst_agent, next_hop_agent_id
+                    );
+                }
+            }
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
+            }
+        }
+    }
+
+    peer_map.lock().await.remove(&peer.session.remote.agent_id);
+    registry
+        .lock()
+        .await
+        .remove_peer_state(&peer.session.remote.agent_id);
+    Ok(())
+}
+
+pub async fn run_inbound_task_server_h2(
+    identity: AgentIdentity,
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    local_services: Vec<String>,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+    peer_map: H2TaskPeerMap,
+    relay_stream_allocator: H2RelayStreamAllocator,
+    relay_links: RelayLinkMap,
+) -> Result<(), Error> {
+    loop {
+        let peer =
+            h2_mux::accept_mux_peer_on(identity.clone(), &listener, tls_acceptor.clone()).await?;
+        let identity = identity.clone();
+        let local_services = local_services.clone();
+        let hub = hub.clone();
+        let registry = registry.clone();
+        let peer_map = peer_map.clone();
+        let relay_stream_allocator = relay_stream_allocator.clone();
+        let relay_links = relay_links.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_inbound_task_peer_h2(
+                identity,
+                local_services,
+                hub,
+                registry,
+                peer_map,
+                relay_stream_allocator,
+                relay_links,
+                peer,
+            )
+            .await
+            {
+                eprintln!("session.inbound.peer.error={err}");
+            }
+        });
+    }
+}
+
+pub async fn handle_inbound_task_peer_h2(
+    identity: AgentIdentity,
+    local_services: Vec<String>,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+    peer_map: H2TaskPeerMap,
+    relay_stream_allocator: H2RelayStreamAllocator,
+    relay_links: RelayLinkMap,
+    peer: h2_mux::MuxH2Peer,
+) -> Result<(), Error> {
+    hub.lock().await.upsert(peer.session.clone());
+    registry.lock().await.upsert_peer(peer.session.clone());
+    peer_map
+        .lock()
+        .await
+        .insert(peer.session.remote.agent_id.clone(), peer.clone());
+    println!(
+        "session.inbound.peer={} from={} via=h2",
+        peer.session.remote.agent_id, peer.peer_addr
+    );
+    send_direct_announce_h2_mux(&peer, &identity, &local_services).await?;
+    let route_snapshot = {
+        let mut registry_guard = registry.lock().await;
+        let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
+        if pruned > 0 {
+            report_route_pruned(pruned);
+        }
+        registry_guard.routes_snapshot()
+    };
+    send_route_snapshot_h2_mux(
+        &peer,
+        &identity,
+        &route_snapshot,
+        Some(peer.session.remote.agent_id.clone()),
+    )
+    .await?;
+
+    let stream_peer = peer.clone();
+    let stream_peer_map = peer_map.clone();
+    let stream_allocator = relay_stream_allocator.clone();
+    let stream_relay_links = relay_links.clone();
+    tokio::spawn(async move {
+        loop {
+            let open_frame = match stream_peer.read_stream_open_frame().await {
+                Ok(frame) => frame,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => {
+                    eprintln!("stream.relay.accept.error={err}");
+                    break;
+                }
+            };
+            if let Err(err) = handle_h2_relay_stream_open(
+                stream_peer_map.clone(),
+                stream_allocator.clone(),
+                stream_relay_links.clone(),
+                stream_peer.clone(),
+                open_frame,
+            )
+            .await
+            {
+                eprintln!("stream.relay.open.error={err}");
+            }
+        }
+    });
+
+    loop {
+        let frame = match peer.read_control_frame().await {
+            Ok(frame) => frame,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err),
+        };
+
+        let handled_control = {
+            let mut registry_guard = registry.lock().await;
+            handle_registry_control_message(
+                &mut registry_guard,
+                &identity.id,
+                &peer.session.remote.agent_id,
+                &frame.message,
+            )
+        };
+        if handled_control {
+            broadcast_control_frame_h2(&peer_map, &identity, &peer.session.remote.agent_id, &frame)
+                .await?;
+            continue;
+        }
+
+        let route_decision = {
+            let mut registry_guard = registry.lock().await;
+            let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
+            if pruned > 0 {
+                report_route_pruned(pruned);
+            }
+            decide_frame_route(&identity.id, &registry_guard, &frame)
+        };
+        match route_decision {
+            RouteDecision::Local => {}
+            RouteDecision::Forward { next_hop_agent_id } => {
+                if next_hop_agent_id == peer.session.remote.agent_id {
+                    eprintln!(
+                        "relay.drop.loop dst={:?} next_hop={} source_peer={}",
+                        frame.header.dst_agent, next_hop_agent_id, peer.session.remote.agent_id
+                    );
+                    continue;
+                }
+                let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
+                if let Some(next_hop) = next_hop {
+                    next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
+                    eprintln!(
+                        "relay.forward.sent dst={:?} next_hop={}",
+                        frame.header.dst_agent, next_hop_agent_id
+                    );
+                } else {
+                    eprintln!(
+                        "relay.forward.missing_next_hop dst={:?} next_hop={}",
+                        frame.header.dst_agent, next_hop_agent_id
+                    );
+                }
+                continue;
+            }
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
+                continue;
+            }
+        }
+
+        match frame.message {
+            Message::TaskRequest(request) => {
+                let response_dst = frame
+                    .header
+                    .src_agent
+                    .clone()
+                    .unwrap_or_else(|| peer.session.remote.agent_id.clone());
+                let result = dispatcher::dispatch(&request).await;
+                let response = Frame::new(
+                    MessageType::TaskResult,
+                    Some(peer.session.local.agent_id.clone()),
+                    Some(response_dst),
+                    Message::TaskResult(result),
+                );
+                peer.send_frame(&response).await?;
+            }
+            other => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("unexpected message on h2 task server: {:?}", other),
+                ))
+            }
+        }
+    }
+
+    peer_map.lock().await.remove(&peer.session.remote.agent_id);
+    registry
+        .lock()
+        .await
+        .remove_peer_state(&peer.session.remote.agent_id);
+    Ok(())
+}

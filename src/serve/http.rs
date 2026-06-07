@@ -197,15 +197,17 @@ fn extract_proxy_authorization<'a, I>(lines: I) -> Option<String>
 where
     I: Iterator<Item = &'a str>,
 {
-    lines.take_while(|line| !line.is_empty()).find_map(|header| {
-        if is_proxy_authorization_header(header) {
-            header
-                .split_once(':')
-                .map(|(_, value)| value.trim().to_string())
-        } else {
-            None
-        }
-    })
+    lines
+        .take_while(|line| !line.is_empty())
+        .find_map(|header| {
+            if is_proxy_authorization_header(header) {
+                header
+                    .split_once(':')
+                    .map(|(_, value)| value.trim().to_string())
+            } else {
+                None
+            }
+        })
 }
 
 fn origin_form_path(url: &Url) -> String {
@@ -371,7 +373,9 @@ mod tests {
             Some(format!("Basic {token}").as_str())
         );
         let payload = String::from_utf8(request.initial_payload).unwrap();
-        assert!(!payload.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert!(!payload
+            .to_ascii_lowercase()
+            .contains("proxy-authorization:"));
     }
 
     #[test]
@@ -381,8 +385,6 @@ mod tests {
         )
         .unwrap();
         let token = BASE64.encode(b"demo:secret");
-        service
-            .authorize(Some(&format!("Basic {token}")))
-            .unwrap();
+        service.authorize(Some(&format!("Basic {token}"))).unwrap();
     }
 }

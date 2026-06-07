@@ -8,14 +8,14 @@ use crate::{
     serve::{
         portfwd::{proxy_connection as proxy_port_forward_connection, PortForwardService},
         raw::{
-            proxy_mux_stream_loop, proxy_simplex_mux_stream_loop,
-            proxy_simplex_dns_mux_stream_loop, proxy_simplex_oss_mux_stream_loop,
+            proxy_mux_stream_loop, proxy_h2_mux_stream_loop, proxy_simplex_dns_mux_stream_loop,
+            proxy_simplex_mux_stream_loop, proxy_simplex_oss_mux_stream_loop,
             proxy_ws_mux_stream_loop,
         },
         service::{ServiceDefinition, ServiceKind},
     },
     session::hub::SessionHub,
-    tunnel::{simplex_dns_mux, simplex_http_mux, simplex_oss_mux, tcp_mux, ws_mux},
+    tunnel::{h2_mux, simplex_dns_mux, simplex_http_mux, simplex_oss_mux, tcp_mux, ws_mux},
 };
 use tokio::{net::TcpListener, sync::Mutex};
 
@@ -179,6 +179,73 @@ pub async fn run_inbound_raw_ws_once(
     Ok(())
 }
 
+pub async fn run_inbound_raw_h2_once(
+    identity: AgentIdentity,
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    raw_service_definition: ServiceDefinition,
+    hub: Arc<Mutex<SessionHub>>,
+    registry: Arc<Mutex<AgentRegistry>>,
+) -> Result<(), Error> {
+    let peer = h2_mux::accept_mux_peer(identity, listener, tls_acceptor).await?;
+    hub.lock().await.upsert(peer.session.clone());
+    registry.lock().await.upsert_peer(peer.session.clone());
+    println!(
+        "session.inbound.peer={} from={} via=h2",
+        peer.session.remote.agent_id, peer.peer_addr
+    );
+
+    let raw_service = match raw_service_definition.kind {
+        ServiceKind::RemoteRaw(service) => service,
+        _ => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "inbound raw handler requires remote raw service",
+            ))
+        }
+    };
+
+    loop {
+        let (stream_id, open) = match peer.read_stream_open().await {
+            Ok(value) => value,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err),
+        };
+        let target = resolve_stream_target_label(
+            &open.target_host,
+            open.target_port,
+            &raw_service.target_label(),
+        );
+        registry.lock().await.open_stream(
+            stream_id,
+            peer.session.remote.agent_id.clone(),
+            open.service.clone(),
+            target,
+        );
+        registry.lock().await.mark_stream_active(stream_id);
+        let stream_rx = peer.open_stream_receiver(stream_id).await;
+        let peer_handle = peer.clone();
+        let raw_service = raw_service.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                proxy_h2_mux_stream_loop(peer_handle, &raw_service, open, stream_id, stream_rx)
+                    .await
+            {
+                registry
+                    .lock()
+                    .await
+                    .mark_stream_failed(stream_id, err.to_string());
+                eprintln!("stream.inbound.error={} stream_id={}", err, stream_id);
+            } else {
+                registry.lock().await.mark_stream_closed(stream_id);
+            }
+        });
+    }
+
+    Ok(())
+}
+
 pub async fn run_inbound_raw_simplex_once(
     identity: AgentIdentity,
     listener: TcpListener,
@@ -228,14 +295,9 @@ pub async fn run_inbound_raw_simplex_once(
         let raw_service = raw_service.clone();
         let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(err) = proxy_simplex_mux_stream_loop(
-                peer_handle,
-                &raw_service,
-                open,
-                stream_id,
-                stream_rx,
-            )
-            .await
+            if let Err(err) =
+                proxy_simplex_mux_stream_loop(peer_handle, &raw_service, open, stream_id, stream_rx)
+                    .await
             {
                 registry
                     .lock()

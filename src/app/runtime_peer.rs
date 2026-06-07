@@ -10,20 +10,20 @@ use crate::{
         config::TunnelEndpoint,
         runtime_relay::{
             broadcast_control_frame_simplex_dns, broadcast_control_frame_simplex_http,
-            broadcast_control_frame_tcp, broadcast_control_frame_simplex_oss,
-            broadcast_control_frame_ws,
-            handle_registry_control_message, handle_tcp_relay_stream_open,
+            broadcast_control_frame_simplex_oss, broadcast_control_frame_tcp,
+            broadcast_control_frame_ws, handle_registry_control_message,
             handle_simplex_dns_relay_stream_open, handle_simplex_oss_relay_stream_open,
-            handle_simplex_relay_stream_open,
-            handle_ws_relay_stream_open,
-            send_direct_announce_simplex_dns, send_direct_announce_simplex_http,
-            send_direct_announce_simplex_oss, send_direct_announce_tcp_mux,
-            send_direct_announce_ws_mux, send_route_snapshot_simplex_dns_mux,
-            send_route_snapshot_simplex_http_mux, send_route_snapshot_simplex_oss_mux,
-            send_route_snapshot_tcp_mux, send_route_snapshot_ws_mux, ROUTE_TTL_SECS,
+            handle_simplex_relay_stream_open, handle_tcp_relay_stream_open,
+            handle_ws_relay_stream_open, send_direct_announce_simplex_dns,
+            send_direct_announce_simplex_http, send_direct_announce_simplex_oss,
+            send_direct_announce_tcp_mux, send_direct_announce_ws_mux,
+            send_route_snapshot_simplex_dns_mux, send_route_snapshot_simplex_http_mux,
+            send_route_snapshot_simplex_oss_mux, send_route_snapshot_tcp_mux,
+            send_route_snapshot_ws_mux, ROUTE_TTL_SECS,
         },
         runtime_status::RelayLinkMap,
     },
+    error::report_route_pruned,
     protocol::{
         frame::{Frame, MessageType},
         message::Message,
@@ -35,7 +35,10 @@ use crate::{
     task::dispatcher,
     tunnel::{simplex_dns_mux, simplex_http_mux, simplex_oss_mux, tcp_mux, ws_mux},
 };
-use tokio::{net::{TcpListener, UdpSocket}, sync::Mutex};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::Mutex,
+};
 
 pub type TcpTaskPeerMap = Arc<Mutex<HashMap<String, tcp_mux::MuxTcpPeer>>>;
 pub type WsTaskPeerMap = Arc<Mutex<HashMap<String, ws_mux::MuxWsPeer>>>;
@@ -111,7 +114,7 @@ pub async fn handle_inbound_task_peer_tcp(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -182,7 +185,7 @@ pub async fn handle_inbound_task_peer_tcp(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -199,6 +202,9 @@ pub async fn handle_inbound_task_peer_tcp(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                     eprintln!(
                         "relay.forward.sent dst={:?} next_hop={}",
                         frame.header.dst_agent, next_hop_agent_id
@@ -214,7 +220,7 @@ pub async fn handle_inbound_task_peer_tcp(
             RouteDecision::DropNoRoute {
                 destination_agent_id,
             } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+                crate::error::report_relay_no_route(&destination_agent_id);
                 continue;
             }
         }
@@ -289,7 +295,7 @@ pub async fn run_outbound_relay_peer_tcp(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -360,7 +366,7 @@ pub async fn run_outbound_relay_peer_tcp(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -399,6 +405,9 @@ pub async fn run_outbound_relay_peer_tcp(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                     eprintln!(
                         "relay.forward.sent dst={:?} next_hop={}",
                         frame.header.dst_agent, next_hop_agent_id
@@ -413,7 +422,7 @@ pub async fn run_outbound_relay_peer_tcp(
             RouteDecision::DropNoRoute {
                 destination_agent_id,
             } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+                crate::error::report_relay_no_route(&destination_agent_id);
             }
         }
     }
@@ -476,7 +485,7 @@ pub async fn handle_inbound_task_peer_simplex_http(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -547,7 +556,7 @@ pub async fn handle_inbound_task_peer_simplex_http(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -564,6 +573,9 @@ pub async fn handle_inbound_task_peer_simplex_http(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -572,8 +584,10 @@ pub async fn handle_inbound_task_peer_simplex_http(
                 }
                 continue;
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
                 continue;
             }
         }
@@ -637,7 +651,7 @@ pub async fn run_outbound_relay_peer_simplex_http(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -708,7 +722,7 @@ pub async fn run_outbound_relay_peer_simplex_http(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -732,7 +746,10 @@ pub async fn run_outbound_relay_peer_simplex_http(
                 other => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("unexpected message on outbound simplex relay peer: {:?}", other),
+                        format!(
+                            "unexpected message on outbound simplex relay peer: {:?}",
+                            other
+                        ),
                     ))
                 }
             },
@@ -743,6 +760,9 @@ pub async fn run_outbound_relay_peer_simplex_http(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -750,8 +770,10 @@ pub async fn run_outbound_relay_peer_simplex_http(
                     );
                 }
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
             }
         }
     }
@@ -790,7 +812,7 @@ pub async fn run_inbound_task_server_simplex_oss(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -861,7 +883,7 @@ pub async fn run_inbound_task_server_simplex_oss(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -874,6 +896,9 @@ pub async fn run_inbound_task_server_simplex_oss(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -882,8 +907,10 @@ pub async fn run_inbound_task_server_simplex_oss(
                 }
                 continue;
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
                 continue;
             }
         }
@@ -948,7 +975,7 @@ pub async fn run_outbound_relay_peer_simplex_oss(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -1019,7 +1046,7 @@ pub async fn run_outbound_relay_peer_simplex_oss(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -1043,7 +1070,10 @@ pub async fn run_outbound_relay_peer_simplex_oss(
                 other => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("unexpected message on outbound simplex oss relay peer: {:?}", other),
+                        format!(
+                            "unexpected message on outbound simplex oss relay peer: {:?}",
+                            other
+                        ),
                     ))
                 }
             },
@@ -1054,6 +1084,9 @@ pub async fn run_outbound_relay_peer_simplex_oss(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -1061,8 +1094,10 @@ pub async fn run_outbound_relay_peer_simplex_oss(
                     );
                 }
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
             }
         }
     }
@@ -1102,7 +1137,7 @@ pub async fn run_inbound_task_server_simplex_dns(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -1173,7 +1208,7 @@ pub async fn run_inbound_task_server_simplex_dns(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -1186,6 +1221,9 @@ pub async fn run_inbound_task_server_simplex_dns(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -1194,8 +1232,10 @@ pub async fn run_inbound_task_server_simplex_dns(
                 }
                 continue;
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
                 continue;
             }
         }
@@ -1260,7 +1300,7 @@ pub async fn run_outbound_relay_peer_simplex_dns(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -1331,7 +1371,7 @@ pub async fn run_outbound_relay_peer_simplex_dns(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -1355,7 +1395,10 @@ pub async fn run_outbound_relay_peer_simplex_dns(
                 other => {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("unexpected message on outbound simplex dns relay peer: {:?}", other),
+                        format!(
+                            "unexpected message on outbound simplex dns relay peer: {:?}",
+                            other
+                        ),
                     ))
                 }
             },
@@ -1366,6 +1409,9 @@ pub async fn run_outbound_relay_peer_simplex_dns(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                 } else {
                     eprintln!(
                         "relay.forward.missing_next_hop dst={:?} next_hop={}",
@@ -1373,8 +1419,10 @@ pub async fn run_outbound_relay_peer_simplex_dns(
                     );
                 }
             }
-            RouteDecision::DropNoRoute { destination_agent_id } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+            RouteDecision::DropNoRoute {
+                destination_agent_id,
+            } => {
+                crate::error::report_relay_no_route(&destination_agent_id);
             }
         }
     }
@@ -1414,7 +1462,7 @@ pub async fn run_outbound_relay_peer_ws(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -1480,7 +1528,7 @@ pub async fn run_outbound_relay_peer_ws(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -1519,6 +1567,9 @@ pub async fn run_outbound_relay_peer_ws(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                     eprintln!(
                         "relay.forward.sent dst={:?} next_hop={}",
                         frame.header.dst_agent, next_hop_agent_id
@@ -1533,7 +1584,7 @@ pub async fn run_outbound_relay_peer_ws(
             RouteDecision::DropNoRoute {
                 destination_agent_id,
             } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+                crate::error::report_relay_no_route(&destination_agent_id);
             }
         }
     }
@@ -1611,7 +1662,7 @@ pub async fn handle_inbound_task_peer_ws(
         let mut registry_guard = registry.lock().await;
         let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
         if pruned > 0 {
-            eprintln!("registry.route_pruned={}", pruned);
+            report_route_pruned(pruned);
         }
         registry_guard.routes_snapshot()
     };
@@ -1677,7 +1728,7 @@ pub async fn handle_inbound_task_peer_ws(
             let mut registry_guard = registry.lock().await;
             let pruned = registry_guard.prune_stale_routes(ROUTE_TTL_SECS);
             if pruned > 0 {
-                eprintln!("registry.route_pruned={}", pruned);
+                report_route_pruned(pruned);
             }
             decide_frame_route(&identity.id, &registry_guard, &frame)
         };
@@ -1694,6 +1745,9 @@ pub async fn handle_inbound_task_peer_ws(
                 let next_hop = { peer_map.lock().await.get(&next_hop_agent_id).cloned() };
                 if let Some(next_hop) = next_hop {
                     next_hop.send_frame(&frame).await?;
+                    if let Some(dst) = frame.header.dst_agent.as_deref() {
+                        registry.lock().await.mark_route_forward_success(dst);
+                    }
                     eprintln!(
                         "relay.forward.sent dst={:?} next_hop={}",
                         frame.header.dst_agent, next_hop_agent_id
@@ -1709,7 +1763,7 @@ pub async fn handle_inbound_task_peer_ws(
             RouteDecision::DropNoRoute {
                 destination_agent_id,
             } => {
-                eprintln!("relay.drop.no_route dst={}", destination_agent_id);
+                crate::error::report_relay_no_route(&destination_agent_id);
                 continue;
             }
         }

@@ -57,6 +57,63 @@ cargo run --bin fusion -- \
   -a entry-node
 ```
 
+## Simplex HTTP：本地 socks5 -> 远端 raw
+
+入口节点也可以通过 `simplex+http://` mux 承载 socks5 本地入口：
+
+```bash
+cargo run --bin fusion -- \
+  -c simplex+http://127.0.0.1:39090/socks \
+  -l socks5://127.0.0.1:1080 \
+  -r raw:// \
+  -a entry-node
+```
+
+边界：
+- 当前已验证 socks5 over `simplex+http://` 到远端 `raw://`
+- http proxy over Simplex 仍待后续扩展
+
+## Simplex HTTP：port forward -> 远端固定目标
+
+仅配置 `port://` 远端服务并通过 `simplex+http://` 出站时，本地监听端口经 mux 隧道转发到固定 target（不再在本机直接 TCP 连接 target）：
+
+```bash
+cargo run --bin fusion -- \
+  -c simplex+http://127.0.0.1:39090/port \
+  -r "port://127.0.0.1:9000->127.0.0.1:22" \
+  -a leaf-node
+```
+
+对端需以 mux/raw 处理 `StreamOpen`（与 socks5 出口相同路径）。
+
+## Shadowsocks
+
+当前支持两种本地入口：
+
+```bash
+# 明文请求头（测试/内网）
+-l ss://127.0.0.1:8388?method=none
+
+# Fusion AEAD 请求帧
+-l "ss://127.0.0.1:8388?method=aes-256-gcm-siv&password=secret"
+```
+
+说明：
+- `aes-256-gcm-siv` 保护首个 Shadowsocks 地址请求帧
+- 当前不是完整 Shadowsocks UDP associate，也不承诺与所有 Shadowsocks 客户端逐字节兼容
+
+## Trojan
+
+```bash
+# 明文 TCP 入口（测试/内网）
+-l trojan://127.0.0.1:443?password=secret
+
+# 生产建议加 TLS
+-l "trojan://127.0.0.1:443?password=secret&tls-cert=/path/cert.pem&tls-key=/path/key.pem"
+```
+
+与 socks5/ss 相同，需配对 `-r raw://` 与 `-c tcp://`（或 `wss://`）上游。详见 [`trojan-transport.md`](trojan-transport.md)。
+
 ## 多跳：经 relay 到远端 raw
 
 ```bash

@@ -20,6 +20,7 @@ use crate::{
             build_stream_close_frame, build_stream_data_frame, expect_stream_close_ack,
             write_next_stream_data_to_client,
         },
+        runtime_status::UpstreamPoolStatusMap,
         upstream_pool::{TcpMuxUpstreamPool, WsMuxUpstreamPool},
     },
     protocol::{
@@ -28,7 +29,9 @@ use crate::{
     },
     serve::{
         service::{build_remote_stream_open_for_target, ServiceDefinition, ServiceKind},
-        shadowsocks::{parse_shadowsocks_request, ShadowsocksRequest},
+        shadowsocks::{
+            parse_shadowsocks_request_for_service, ShadowsocksRequest, ShadowsocksService,
+        },
     },
     session::{hub::SessionHub, stream::StreamIdAllocator},
     tunnel::{tcp_mux, ws_mux},
@@ -44,6 +47,7 @@ pub async fn run_outbound_shadowsocks_once(
     registry: Arc<Mutex<AgentRegistry>>,
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
+    pool_status: UpstreamPoolStatusMap,
 ) -> Result<(), Error> {
     let ss_service = match local_ss_definition.kind {
         ServiceKind::LocalShadowsocks(service) => service,
@@ -58,7 +62,7 @@ pub async fn run_outbound_shadowsocks_once(
     let listener = TcpListener::bind(ss_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    let upstream_pool = TcpMuxUpstreamPool::new();
+    let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "shadowsocks");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!(
         "service.local.active=ss://{}{}",
@@ -71,6 +75,7 @@ pub async fn run_outbound_shadowsocks_once(
         println!("service.local.client={} via=ss", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let ss_service = ss_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -86,6 +91,7 @@ pub async fn run_outbound_shadowsocks_once(
                 endpoints,
                 conn_policy,
                 proxy_chain,
+                ss_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -110,6 +116,7 @@ pub async fn run_outbound_shadowsocks_ws_once(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
     conn_policy: ConnPolicy,
+    pool_status: UpstreamPoolStatusMap,
 ) -> Result<(), Error> {
     let ss_service = match local_ss_definition.kind {
         ServiceKind::LocalShadowsocks(service) => service,
@@ -124,7 +131,7 @@ pub async fn run_outbound_shadowsocks_ws_once(
     let listener = TcpListener::bind(ss_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    let upstream_pool = WsMuxUpstreamPool::new();
+    let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "shadowsocks");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!(
         "service.local.active=ss://{}{}",
@@ -137,6 +144,7 @@ pub async fn run_outbound_shadowsocks_ws_once(
         println!("service.local.client={} via=ss", client_addr);
         let endpoints = endpoints.to_vec();
         let identity = identity.clone();
+        let ss_service = ss_service.clone();
         let remote_raw_definition = remote_raw_definition.clone();
         let remote_peer_id = remote_peer_id.clone();
         let registry = registry.clone();
@@ -150,6 +158,7 @@ pub async fn run_outbound_shadowsocks_ws_once(
                 identity,
                 endpoints,
                 conn_policy,
+                ss_service,
                 remote_raw_definition,
                 remote_peer_id,
                 client,
@@ -165,7 +174,10 @@ pub async fn run_outbound_shadowsocks_ws_once(
     }
 }
 
-async fn read_shadowsocks_request(client: &mut TcpStream) -> Result<ShadowsocksRequest, Error> {
+async fn read_shadowsocks_request(
+    client: &mut TcpStream,
+    service: &ShadowsocksService,
+) -> Result<ShadowsocksRequest, Error> {
     let mut buf = Vec::new();
     loop {
         let mut chunk = [0_u8; 4096];
@@ -177,7 +189,7 @@ async fn read_shadowsocks_request(client: &mut TcpStream) -> Result<ShadowsocksR
             ));
         }
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(request) = parse_shadowsocks_request(&buf)? {
+        if let Some(request) = parse_shadowsocks_request_for_service(&buf, service)? {
             return Ok(request);
         }
     }
@@ -185,13 +197,14 @@ async fn read_shadowsocks_request(client: &mut TcpStream) -> Result<ShadowsocksR
 
 pub async fn handle_outbound_shadowsocks_client(
     peer: tcp_mux::MuxTcpPeer,
+    ss_service: ShadowsocksService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    let request = read_shadowsocks_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client, &ss_service).await?;
     handle_shadowsocks_client_inner(
         peer,
         remote_raw_definition,
@@ -206,13 +219,14 @@ pub async fn handle_outbound_shadowsocks_client(
 
 pub async fn handle_outbound_shadowsocks_ws_client(
     peer: ws_mux::MuxWsPeer,
+    ss_service: ShadowsocksService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
     stream_id: u32,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    let request = read_shadowsocks_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client, &ss_service).await?;
     handle_shadowsocks_ws_client_inner(
         peer,
         remote_raw_definition,
@@ -418,6 +432,7 @@ async fn handle_outbound_shadowsocks_client_with_failover_tcp(
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
+    ss_service: ShadowsocksService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -425,7 +440,7 @@ async fn handle_outbound_shadowsocks_client_with_failover_tcp(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    let request = read_shadowsocks_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client, &ss_service).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {
@@ -473,6 +488,7 @@ async fn handle_outbound_shadowsocks_client_with_failover_ws(
     identity: AgentIdentity,
     endpoints: Vec<TunnelEndpoint>,
     conn_policy: ConnPolicy,
+    ss_service: ShadowsocksService,
     remote_raw_definition: ServiceDefinition,
     remote_peer_id: Option<String>,
     mut client: TcpStream,
@@ -480,7 +496,7 @@ async fn handle_outbound_shadowsocks_client_with_failover_ws(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
 ) -> Result<(), Error> {
-    let request = read_shadowsocks_request(&mut client).await?;
+    let request = read_shadowsocks_request(&mut client, &ss_service).await?;
     let attempts = endpoints.len().max(1);
     let mut last_err = None;
     for _ in 0..attempts {

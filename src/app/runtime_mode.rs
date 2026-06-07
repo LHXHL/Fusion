@@ -13,10 +13,13 @@ pub enum InboundRuntimeMode {
     TaskTcp,
     RawWs,
     TaskWs,
+    RawH2,
+    TaskH2,
     RawSimplexDns,
     TaskSimplexDns,
     RawSimplexHttp,
     TaskSimplexHttp,
+    TaskStreamHttp,
     RawSimplexOss,
     TaskSimplexOss,
     DirectUdp,
@@ -33,12 +36,17 @@ pub enum OutboundRuntimeMode {
     Task,
     Socks5Tcp,
     Socks5Ws,
+    Socks5SimplexHttp,
+    PortForwardSimplexHttp,
     HttpProxyTcp,
     HttpProxyWs,
     ShadowsocksTcp,
     ShadowsocksWs,
+    TrojanTcp,
+    TrojanWs,
     RelayTcp,
     RelayWs,
+    RelayH2,
     RelaySimplexDns,
     RelaySimplexHttp,
     RelaySimplexOss,
@@ -57,6 +65,32 @@ pub fn collect_remote_port_forward_services(
         .collect()
 }
 
+pub fn has_remote_port_forward_service(remote_services: &[ServiceDefinition]) -> bool {
+    remote_services
+        .iter()
+        .any(|svc| matches!(svc.kind, ServiceKind::RemotePortForward(_)))
+}
+
+/// Port-forward services that bind locally and connect directly to the target.
+/// When a simplex+http connect is configured, the same port URL is tunneled
+/// over mux instead (see [`OutboundRuntimeMode::PortForwardSimplexHttp`]).
+pub fn direct_port_forward_services(
+    connects: &[TunnelEndpoint],
+    services: &[PortForwardService],
+) -> Vec<PortForwardService> {
+    if services.is_empty() {
+        return Vec::new();
+    }
+    let tunnel_via_simplex = connects.iter().any(|endpoint| {
+        crate::tunnel::http_poll::is_http_poll_scheme(&endpoint.url.scheme)
+    });
+    if tunnel_via_simplex {
+        Vec::new()
+    } else {
+        services.to_vec()
+    }
+}
+
 pub fn decide_inbound_runtime_mode(
     transport: ListenerTransport,
     has_inbound_raw_service: bool,
@@ -67,10 +101,13 @@ pub fn decide_inbound_runtime_mode(
         (ListenerTransport::Tcp, _, _) => InboundRuntimeMode::TaskTcp,
         (ListenerTransport::Ws, true, false) => InboundRuntimeMode::RawWs,
         (ListenerTransport::Ws, _, _) => InboundRuntimeMode::TaskWs,
+        (ListenerTransport::H2, true, false) => InboundRuntimeMode::RawH2,
+        (ListenerTransport::H2, _, _) => InboundRuntimeMode::TaskH2,
         (ListenerTransport::SimplexDns, true, false) => InboundRuntimeMode::RawSimplexDns,
         (ListenerTransport::SimplexDns, _, _) => InboundRuntimeMode::TaskSimplexDns,
         (ListenerTransport::SimplexHttp, true, false) => InboundRuntimeMode::RawSimplexHttp,
         (ListenerTransport::SimplexHttp, _, _) => InboundRuntimeMode::TaskSimplexHttp,
+        (ListenerTransport::StreamHttp, _, _) => InboundRuntimeMode::TaskStreamHttp,
         (ListenerTransport::SimplexOss, true, false) => InboundRuntimeMode::RawSimplexOss,
         (ListenerTransport::SimplexOss, _, true) => InboundRuntimeMode::TaskSimplexOss,
         (ListenerTransport::SimplexOss, _, false) => InboundRuntimeMode::DirectSimplexOss,
@@ -88,7 +125,9 @@ pub fn decide_outbound_runtime_mode(
     has_local_socks: bool,
     has_local_http_proxy: bool,
     has_local_shadowsocks: bool,
+    has_local_trojan: bool,
     has_remote_egress: bool,
+    has_remote_port_forward: bool,
     has_listener: bool,
 ) -> OutboundRuntimeMode {
     if task_request.is_some() {
@@ -97,8 +136,9 @@ pub fn decide_outbound_runtime_mode(
 
     let is_tcp = endpoint.url.scheme == "tcp";
     let is_ws = matches!(endpoint.url.scheme.as_str(), "ws" | "wss");
-    let is_simplex_dns = endpoint.url.scheme == "simplex+dns";
-    let is_simplex_http = endpoint.url.scheme == "simplex+http";
+    let is_h2 = crate::tunnel::h2_tunnel::is_h2_tunnel_scheme(&endpoint.url.scheme);
+    let is_simplex_dns = crate::tunnel::dns_tunnel::is_dns_tunnel_scheme(&endpoint.url.scheme);
+    let is_simplex_http = crate::tunnel::http_poll::is_http_poll_scheme(&endpoint.url.scheme);
     let is_simplex_oss = endpoint.url.scheme == "simplex+oss";
 
     if is_tcp && has_local_socks && has_remote_egress {
@@ -106,6 +146,18 @@ pub fn decide_outbound_runtime_mode(
     }
     if is_ws && has_local_socks && has_remote_egress {
         return OutboundRuntimeMode::Socks5Ws;
+    }
+    if is_simplex_http && has_local_socks && has_remote_egress {
+        return OutboundRuntimeMode::Socks5SimplexHttp;
+    }
+    if is_simplex_http
+        && has_remote_port_forward
+        && !has_local_socks
+        && !has_local_http_proxy
+        && !has_local_shadowsocks
+        && !has_listener
+    {
+        return OutboundRuntimeMode::PortForwardSimplexHttp;
     }
     if is_tcp && has_local_http_proxy && has_remote_egress {
         return OutboundRuntimeMode::HttpProxyTcp;
@@ -119,11 +171,20 @@ pub fn decide_outbound_runtime_mode(
     if is_ws && has_local_shadowsocks && has_remote_egress {
         return OutboundRuntimeMode::ShadowsocksWs;
     }
+    if is_tcp && has_local_trojan && has_remote_egress {
+        return OutboundRuntimeMode::TrojanTcp;
+    }
+    if is_ws && has_local_trojan && has_remote_egress {
+        return OutboundRuntimeMode::TrojanWs;
+    }
     if is_tcp && has_listener {
         return OutboundRuntimeMode::RelayTcp;
     }
     if is_ws && has_listener {
         return OutboundRuntimeMode::RelayWs;
+    }
+    if is_h2 && has_listener {
+        return OutboundRuntimeMode::RelayH2;
     }
     if is_simplex_dns && has_listener {
         return OutboundRuntimeMode::RelaySimplexDns;
@@ -287,57 +348,161 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 false
             ),
             OutboundRuntimeMode::Task
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, true, false, false, true, false),
+            decide_outbound_runtime_mode(&tcp, None, true, false, false, false, true, false, false),
             OutboundRuntimeMode::Socks5Tcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, true, false, false, true, false),
+            decide_outbound_runtime_mode(&ws, None, true, false, false, false, true, false, false),
             OutboundRuntimeMode::Socks5Ws
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, true, false, true, false),
+            decide_outbound_runtime_mode(
+                &simplex,
+                None,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
+            OutboundRuntimeMode::Socks5SimplexHttp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(
+                &simplex,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false
+            ),
+            OutboundRuntimeMode::PortForwardSimplexHttp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&tcp, None, false, true, false, false, true, false, false),
             OutboundRuntimeMode::HttpProxyTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, false, true, false, true, false),
+            decide_outbound_runtime_mode(&ws, None, false, true, false, false, true, false, false),
             OutboundRuntimeMode::HttpProxyWs
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, false, true, true, false),
+            decide_outbound_runtime_mode(&tcp, None, false, false, true, false, true, false, false),
             OutboundRuntimeMode::ShadowsocksTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&ws, None, false, false, true, true, false),
+            decide_outbound_runtime_mode(&ws, None, false, false, true, false, true, false, false),
             OutboundRuntimeMode::ShadowsocksWs
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&tcp, None, false, false, false, false, true),
+            decide_outbound_runtime_mode(&tcp, None, false, false, false, true, true, false, false),
+            OutboundRuntimeMode::TrojanTcp
+        );
+        assert_eq!(
+            decide_outbound_runtime_mode(&tcp, None, false, false, false, false, false, false, true),
             OutboundRuntimeMode::RelayTcp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&simplex_dns, None, false, false, false, false, true),
+            decide_outbound_runtime_mode(
+                &simplex_dns,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
             OutboundRuntimeMode::RelaySimplexDns
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&simplex, None, false, false, false, false, true),
+            decide_outbound_runtime_mode(
+                &simplex,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
             OutboundRuntimeMode::RelaySimplexHttp
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&simplex_oss, None, false, false, false, false, true),
+            decide_outbound_runtime_mode(
+                &simplex_oss,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
             OutboundRuntimeMode::RelaySimplexOss
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&udp, None, false, false, false, false, true),
+            decide_outbound_runtime_mode(
+                &udp,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
             OutboundRuntimeMode::Direct
         );
         assert_eq!(
-            decide_outbound_runtime_mode(&memory, None, false, false, false, false, false),
+            decide_outbound_runtime_mode(
+                &memory,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             OutboundRuntimeMode::Direct
+        );
+    }
+
+    #[test]
+    fn direct_port_forward_skipped_when_simplex_connect_configured() {
+        use super::direct_port_forward_services;
+
+        let service = PortForwardService {
+            listen_host: "127.0.0.1".into(),
+            listen_port: 9000,
+            target_host: "example.com".into(),
+            target_port: 80,
+        };
+        let simplex = vec![TunnelEndpoint {
+            url: ParsedUrl::parse("simplex+http://127.0.0.1:8080/tunnel").unwrap(),
+        }];
+        assert!(direct_port_forward_services(&simplex, &[service.clone()]).is_empty());
+        assert_eq!(
+            direct_port_forward_services(&[], &[service]).len(),
+            1
         );
     }
 

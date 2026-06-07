@@ -113,6 +113,7 @@ cargo run --bin fusion -- -c wg://127.0.0.1:39060 -a wg-b
 
 ```bash
 cargo run --bin fusion -- status
+cargo run --bin fusion -- status --json
 cargo run --bin fusion -- peers list
 cargo run --bin fusion -- routes list
 cargo run --bin fusion -- services list
@@ -130,7 +131,7 @@ cargo build --lib
 - `staticlib`
 
 头文件：
-- `/Users/qi4l/lang/Rust/Fusion-master/include/fusion.h`
+- [`include/fusion.h`](../include/fusion.h)
 
 ## 12. Phase 5 第一版：代理链与连接池
 
@@ -147,8 +148,23 @@ cargo run --bin fusion -- \
 - `-f` 会作为代理链第一跳
 - `-x` 可追加后续跳点
 - 当前 `conn-policy` 主要作用于多上游 endpoint 的 task / direct 路径
+- `-c up-tcp://...` / `-c down-ws://...` 与 `--up-connect` / `--down-connect` 等价（见 [docs/http-transport.md](http-transport.md)）
 
-## 13. 使用配置文件
+## 13.1 HTTP / streamhttp 隧道
+
+```bash
+# http:// 长轮询（与 simplex+http 同协议栈）
+cargo run --bin fusion -- -s http://0.0.0.0:39090/task -a http-server
+cargo run --bin fusion -- -c http://127.0.0.1:39090/task --task-peer <PEER_ID> task shell "whoami"
+
+# streamhttp:// SSE 下行 + POST 上行
+cargo run --bin fusion -- -s streamhttp://0.0.0.0:39100/task -a sse-server
+cargo run --bin fusion -- -c streamhttp://127.0.0.1:39100/task --task-peer <PEER_ID> task shell "whoami"
+```
+
+详见 [docs/http-transport.md](http-transport.md)。
+
+## 14. 使用配置文件
 
 ```bash
 cp fusion.toml.example fusion.toml
@@ -204,5 +220,60 @@ cargo run --bin fusion -- \
 ```
 
 说明：
-- `simplex+http://` 当前已可承载 direct task 请求
-- 当前仍未接入 mux / relay / `simplex+dns://` / `simplex+oss://`
+- `simplex+http://` 已支持 direct task、mux、raw service 与 relay
+- 详见 [docs/simplex-transport.md](simplex-transport.md)
+
+## 17. simplex+dns / simplex+oss task
+
+```bash
+# DNS
+cargo run --bin fusion -- \
+  -s simplex+dns://0.0.0.0:5353/task.local \
+  -a simplex-dns-server
+
+cargo run --bin fusion -- \
+  -c simplex+dns://127.0.0.1:5353/task.local \
+  --task-peer <PEER_ID> \
+  task shell "whoami"
+
+# OSS（需共享 root 目录）
+ROOT=/tmp/fusion-simplex-oss
+cargo run --bin fusion -- \
+  -s "simplex+oss://mesh-server/channel?root=$ROOT" \
+  -a simplex-oss-server
+
+cargo run --bin fusion -- \
+  -c "simplex+oss://mesh-client/channel?root=$ROOT" \
+  --task-peer <PEER_ID> \
+  task shell "whoami"
+```
+
+说明：
+- 两类 transport 均已接入 runtime、mux 与 relay
+- `dns://` 为 `simplex+dns://` 等价别名（可将 DNS 示例中的 scheme 互换）
+- 延迟与 payload 限制见 [docs/simplex-transport.md](simplex-transport.md)
+
+## 18. h2:// HTTP/2 mux 隧道
+
+```bash
+cargo run --bin fusion -- \
+  -s h2://0.0.0.0:39200/tunnel \
+  -a h2-server
+
+cargo run --bin fusion -- \
+  -c h2://127.0.0.1:39200/tunnel \
+  --task-peer <PEER_ID> \
+  task shell "whoami"
+```
+
+TLS 示例（`h2s://`）：
+
+```bash
+cargo run --bin fusion -- \
+  -s "h2s://0.0.0.0:443/tunnel?tls-cert=/path/cert.pem&tls-key=/path/key.pem" \
+  -a h2s-server
+```
+
+说明：
+- 支持 direct task、mux、raw 入站与 relay
+- 详见 [docs/h2-transport.md](h2-transport.md)

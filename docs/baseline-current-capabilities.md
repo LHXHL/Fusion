@@ -9,7 +9,7 @@
 - `fusion`
 
 入口文件：
-- `/Users/qi4l/lang/Rust/Fusion-master/src/bin/fusion.rs`
+- `src/bin/fusion.rs`
 
 ## 2. Tunnel 类型
 
@@ -22,6 +22,8 @@
 - `memory://`
 - `icmp://`
 - `wg://`
+- `h2://` / `h2s://`（HTTP/2 mux；单 h2 控制 stream 承载 Fusion 帧，详见 [`h2-transport.md`](h2-transport.md)）
+- `dns://`（`simplex+dns://` 别名，UDP DNS 查询信道）
 
 说明：
 - `memory://` 当前面向同进程测试与嵌入模式，不是跨独立 CLI 进程的持久监听 transport
@@ -34,7 +36,7 @@
 - CLI 接受该 scheme
 - runtime 监听/连接分支支持该 scheme
 - 已提供独立 TLS 收口模块：
-  - `/Users/qi4l/lang/Rust/Fusion-master/src/tunnel/tls.rs`
+  - `src/tunnel/tls.rs`
 - 服务端监听支持：
   - `tls-cert=/absolute/path/to/cert.pem`
   - `tls-key=/absolute/path/to/key.pem`
@@ -56,6 +58,8 @@
 - `socks5://HOST:PORT`
 - `http://HOST:PORT`
 - `ss://HOST:PORT?method=none`
+- `ss://HOST:PORT?method=aes-256-gcm-siv&password=...`
+- `trojan://HOST:PORT?password=...`（可选 `tls-cert`/`tls-key`）
 
 ### 3.2 远端出口/暴露服务
 - `raw://HOST:PORT`
@@ -79,10 +83,10 @@
 - download
 
 对应实现：
-- `/Users/qi4l/lang/Rust/Fusion-master/src/task/shell.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/task/screenshot.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/task/file.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/task/dispatcher.rs`
+- `src/task/shell.rs`
+- `src/task/screenshot.rs`
+- `src/task/file.rs`
+- `src/task/dispatcher.rs`
 
 ## 5. CLI 参数
 
@@ -131,6 +135,12 @@
 当前会在 `data-dir` 下写入：
 - `runtime-status.json`
 
+快照 JSON 主要字段：
+- `peers` / `routes` / `streams` / `relay_links`
+- `config`：wrapper、shared-key、connect/up-connect/down-connect、conn_policy、proxy chain 摘要
+- `upstream_pools`：本地入口（socks5/http/shadowsocks）上游 mux 池的 handler、transport、cached_keys
+- `recent_errors`：最近 32 条统一错误码记录（见 `src/error.rs`）
+
 默认目录：
 - `.fusion/`
 
@@ -141,14 +151,15 @@
 - `cdylib`
 - `staticlib`
 
-当前已导出基础 C ABI：
-- `fusion_abi_version`
-- `fusion_version_string`
-- `fusion_parse_url_json`
-- `fusion_string_free`
+当前已导出 C ABI v2（详见 [embedding.md](embedding.md)、[abi-stability.md](abi-stability.md)）：
+- 版本 / 字符串：`fusion_abi_version`、`fusion_logic_api_version`、`fusion_version_string`、`fusion_string_free`
+- 错误：`fusion_last_error`、`fusion_clear_last_error`
+- 纯逻辑（W1）：`fusion_parse_url_json`、`fusion_validate_config_toml_json`、`fusion_filter_status_json`
+- Runtime：`fusion_runtime_create`、`fusion_runtime_destroy`
+- Config / 生命周期：`fusion_runtime_load_config_file`、`fusion_runtime_start`、`fusion_runtime_stop`
+- 查询 / 任务：`fusion_runtime_status_json`、`fusion_runtime_task_request_json`
 
-头文件：
-- `/Users/qi4l/lang/Rust/Fusion-master/include/fusion.h`
+头文件：[`include/fusion.h`](../include/fusion.h)
 
 ## 8. 协议消息类型
 
@@ -165,7 +176,7 @@
 - `StreamClose`
 
 协议说明见：
-- `/Users/qi4l/lang/Rust/Fusion-master/docs/protocol.md`
+- `docs/protocol.md`
 
 ## 9. 已验证场景
 
@@ -182,8 +193,10 @@
 - 3 跳 / 5 跳 TCP mux relay 回归
 - socks5 over relay
 - HTTP proxy over relay
-- Shadowsocks(minimal) service parsing / runtime mode / stream-open builder
+- Shadowsocks service parsing / runtime mode / stream-open builder（`method=none` + Fusion AEAD 请求帧）
+- socks5 over `simplex+http://` 到远端 `raw://`
 - task shell/screenshot/upload/download
+- `dns://` / `h2://` direct task 与 mux relay（3/5 跳回归）
 - runtime status snapshot 输出
 - `port://...->...` 固定端口转发
 
@@ -192,18 +205,33 @@
 ### 10.1 `wss://` 仍属精简 TLS 配置面
 当前已支持显式证书/私钥、客户端 CA/insecure 模式与基础 mTLS 参数面，但仍未覆盖完整企业级 TLS 配置矩阵。
 
-### 10.2 `ss://` 当前为最小版 service
+### 10.2 `ss://` 当前边界
 当前行为：
 - 支持本地 `ss://HOST:PORT?method=none` 入口
+- 支持本地 `ss://HOST:PORT?method=aes-256-gcm-siv&password=SECRET` 入口
 - 支持 TCP/WS 上游 mux 路径
 - 支持 Shadowsocks 地址头解析后转成 `StreamOpen(raw)`
+- `aes-256-gcm-siv` 当前使用 Fusion 自定义请求帧（magic + nonce + length + ciphertext）保护首个 Shadowsocks 地址请求帧
 
 当前未覆盖：
-- 真实 AEAD 算法矩阵
 - UDP 关联
-- 完整 Shadowsocks 加密生态兼容
+- 与完整 Shadowsocks 生态逐字节协议兼容
+- 多算法矩阵（当前仅 `aes-256-gcm-siv`）
 
-### 10.3 `-k` 当前为预共享密钥帧级加密
+### 10.3 `trojan://` 当前边界
+
+当前行为：
+- 支持 `trojan://HOST:PORT?password=SECRET` 本地 TCP 入口
+- 密码校验为 `hex(SHA224(password))`（56 字符）
+- 支持 TCP CONNECT 后 mux 转发到远端 `raw://`
+- 可选 `tls-cert`/`tls-key` 在本地入口启用 TLS
+
+当前未覆盖：
+- UDP ASSOCIATE
+- `externalc2://`（见 [`trojan-transport.md`](trojan-transport.md)）
+- Simplex 专用 Trojan 路径（可经 TCP/WS 上游 mux 间接使用）
+
+### 10.4 `-k` 当前为预共享密钥帧级加密
 当前行为：
 - 对 Fusion 协议帧统一加密
 - 覆盖 hello / heartbeat / task / stream 等消息
@@ -214,7 +242,7 @@
 - 多算法切换
 - 独立压缩 / padding 处理链
 
-### 10.4 结构上未新增以下计划文件
+### 10.5 结构上未新增以下计划文件
 本轮收尾**明确不补空壳文件**：
 - `src/utils/fs.rs`
 
@@ -226,17 +254,17 @@
 本轮已补上，用于让计划结构与实际工程更加一致。
 
 ### 10.6 runtime 职责开始拆分
-当前仍以 `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime.rs` 为主入口，
+当前仍以 `src/app/runtime.rs` 为主入口，
 但以下职责已开始独立收口：
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_status.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_task.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_peer.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_service.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_orchestrator.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_socks5.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_tests.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_relay.rs`
-- `/Users/qi4l/lang/Rust/Fusion-master/src/app/runtime_mode.rs`
+- `src/app/runtime_status.rs`
+- `src/app/runtime_task.rs`
+- `src/app/runtime_peer.rs`
+- `src/app/runtime_service.rs`
+- `src/app/runtime_orchestrator.rs`
+- `src/app/runtime_socks5.rs`
+- `src/app/runtime_tests.rs`
+- `src/app/runtime_relay.rs`
+- `src/app/runtime_mode.rs`
 
 其中本轮进一步将以下路径从 `runtime.rs` 拆出：
 - listener startup / dialer startup / runtime summary 的编排逻辑
@@ -288,7 +316,8 @@
 - 当前已支持基础配置面：
   - `--wrap-compress`
   - `--wrap-padding <BYTES>`
-- 当前仍未形成自动协商式 wrapper 交付面
+- Hello capability 当前会暴露 `wrapper:shared-key`、`wrapper:compress`、`wrapper:padding:<BYTES>`
+- 当前仍不会自动改写本地 wrapper 配置，双端仍需手工对齐
 
 当前意义：
 - transport 层已具备统一挂载点
@@ -297,36 +326,29 @@
 当前仍未覆盖：
 - 更强的 TLS 补强 wrapper
 
-### 10.8 高级网络能力尚未进入当前交付面
-以下仍属于 roadmap 后续阶段，不应视为当前已承诺能力：
-- 本地 socks5/http 入口上的完整多活 ConnHub / 热切换
-- 全量异构 tunnel 级上下行分离
-- `simplex+dns://` / `simplex+oss://`
-- WASM / 跨语言嵌入运行时
+### 10.8 高级网络与 Simplex service 边界
 
-当前已补上的 Phase 6 第一批能力：
+以下仍属于后续规划阶段：
+- 全量异构 tunnel 级上下行分离（当前为连接池拆分）
+- Simplex 上 http 本地入口正式端到端交付（H4 后续）
+- WASM 完整 runtime（W1 纯逻辑已交付，见 [`embedding.md`](embedding.md)、[`release.md`](release.md)）
+
+当前已交付的相关能力：
+- 本地 socks5/http 多上游 failover、长生命周期 upstream mux 池（status 可观测）
+- socks5 本地入口可经 `simplex+http://` mux 到远端 `raw://`
+- route 选优与 recent errors（Phase C）
+- Simplex direct task / mux / raw / relay（详见 [simplex-transport.md](simplex-transport.md)）
+- `dns://` 与 `simplex+dns://` 等价；`h2://` / `h2s://` mux/relay（详见 [h2-transport.md](h2-transport.md)）
 - 特殊 tunnel：
   - `memory://`
   - `unix://`
   - `icmp://`
   - `wg://`
-- simplex：
-  - `simplex+http://` 最小 direct session runtime
-  - hello / heartbeat 握手
-  - 分片 / 重组
-  - 最小片段 ACK / 超时重传
-  - 最小滑窗 / 窗口控制
-  - batch POST 发送
-  - 最小 batch envelope / long-poll receive
-  - 重复包抑制
-  - 基础 frame exchange
 - 平台化：
   - `cdylib` / `staticlib`
-  - 基础 C ABI
-  - `include/fusion.h`
-- simplex / SR-ARQ 已覆盖：
-  - `src/tunnel/simplex.rs`：分片、重组、ACK 窗口、重传队列
-  - `src/tunnel/simplex_http.rs`：最小 HTTP 轮询/long-poll direct session + 分片 ACK / 重传 + 窗口发送 + batch send/receive + dedup
+  - C ABI v2 + Logic API v1（runtime handle、config、status、task、URL 校验）
+  - WASM W1：`crates/fusion-logic`（`wasm32-unknown-unknown`）
+  - 嵌入示例与 [embedding.md](embedding.md)、[release.md](release.md)
 
 当前已补上的 Phase 5 第一版能力：
 - TCP 出站链路可通过 `-x/-f` 走 SOCKS5 / HTTP CONNECT 代理链
@@ -342,6 +364,5 @@
 
 ```bash
 cargo build --bin fusion
-cargo test
-bash scripts/regression/manual-smoke.sh
+cargo test --lib
 ```

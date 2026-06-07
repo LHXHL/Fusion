@@ -68,17 +68,12 @@ impl ActiveSimplexDnsPeer {
             current
         };
         if self.is_client {
-            let remote_addr = self
-                .remote_addr
-                .lock()
-                .await
-                .ok_or_else(|| Error::new(ErrorKind::NotConnected, "dns peer missing remote addr"))?;
-            let session_token = self
-                .session_token
-                .lock()
-                .await
-                .clone()
-                .ok_or_else(|| Error::new(ErrorKind::NotConnected, "dns peer missing session token"))?;
+            let remote_addr = self.remote_addr.lock().await.ok_or_else(|| {
+                Error::new(ErrorKind::NotConnected, "dns peer missing remote addr")
+            })?;
+            let session_token = self.session_token.lock().await.clone().ok_or_else(|| {
+                Error::new(ErrorKind::NotConnected, "dns peer missing session token")
+            })?;
             for (idx, chunk) in chunk_query_payload(&payload).into_iter().enumerate() {
                 let query = encode_query(
                     rand::random(),
@@ -115,17 +110,12 @@ impl ActiveSimplexDnsPeer {
         }
 
         if self.is_client {
-            let remote_addr = self
-                .remote_addr
-                .lock()
-                .await
-                .ok_or_else(|| Error::new(ErrorKind::NotConnected, "dns peer missing remote addr"))?;
-            let session_token = self
-                .session_token
-                .lock()
-                .await
-                .clone()
-                .ok_or_else(|| Error::new(ErrorKind::NotConnected, "dns peer missing session token"))?;
+            let remote_addr = self.remote_addr.lock().await.ok_or_else(|| {
+                Error::new(ErrorKind::NotConnected, "dns peer missing remote addr")
+            })?;
+            let session_token = self.session_token.lock().await.clone().ok_or_else(|| {
+                Error::new(ErrorKind::NotConnected, "dns peer missing session token")
+            })?;
             loop {
                 let poll_seq = {
                     let mut guard = self.next_poll_seq.lock().await;
@@ -229,10 +219,13 @@ impl ActiveSimplexDnsPeer {
         chunk: Vec<u8>,
     ) -> Result<Option<Frame>, Error> {
         let mut inbound = self.inbound.lock().await;
-        let entry = inbound.assemblies.entry(seq).or_insert_with(|| FragmentBuffer {
-            total: frag_total,
-            chunks: vec![None; frag_total.max(1) as usize],
-        });
+        let entry = inbound
+            .assemblies
+            .entry(seq)
+            .or_insert_with(|| FragmentBuffer {
+                total: frag_total,
+                chunks: vec![None; frag_total.max(1) as usize],
+            });
         if entry.total != frag_total {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -335,10 +328,16 @@ pub async fn connect_peer(
 ) -> Result<ActiveSimplexDnsPeer, Error> {
     let parsed = ParsedUrl::parse(endpoint)?;
     let host = parsed.host.clone().ok_or_else(|| {
-        Error::new(ErrorKind::InvalidInput, "missing host for simplex+dns connect")
+        Error::new(
+            ErrorKind::InvalidInput,
+            "missing host for simplex+dns connect",
+        )
     })?;
     let port = parsed.port.ok_or_else(|| {
-        Error::new(ErrorKind::InvalidInput, "missing port for simplex+dns connect")
+        Error::new(
+            ErrorKind::InvalidInput,
+            "missing port for simplex+dns connect",
+        )
     })?;
     let shared_key = identity.shared_key_secret().map(SharedKey::from_secret);
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -361,7 +360,9 @@ pub async fn connect_peer(
         remote_addr: Arc::new(tokio::sync::Mutex::new(Some(
             format!("{host}:{port}")
                 .parse()
-                .map_err(|e: std::net::AddrParseError| Error::new(ErrorKind::InvalidInput, e.to_string()))?,
+                .map_err(|e: std::net::AddrParseError| {
+                    Error::new(ErrorKind::InvalidInput, e.to_string())
+                })?,
         ))),
         session_token: Arc::new(tokio::sync::Mutex::new(Some(format!(
             "{:016x}",
@@ -688,7 +689,10 @@ fn decode_qname(packet: &[u8], mut offset: usize) -> Result<(Vec<String>, usize)
     Ok((labels, offset))
 }
 
-async fn recv_dns_packet(socket: &UdpSocket, expected: Option<SocketAddr>) -> Result<Vec<u8>, Error> {
+async fn recv_dns_packet(
+    socket: &UdpSocket,
+    expected: Option<SocketAddr>,
+) -> Result<Vec<u8>, Error> {
     loop {
         let (packet, remote) = recv_dns_packet_from_any(socket).await?;
         if expected.is_none() || expected == Some(remote) {
@@ -719,7 +723,9 @@ mod tests {
 
     #[tokio::test]
     async fn simplex_dns_task_frame_roundtrip() {
-        let listener = bind("simplex+dns://127.0.0.1:0/tunnel.local").await.unwrap();
+        let listener = bind("simplex+dns://127.0.0.1:0/tunnel.local")
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
             name: Some("simplex-dns-server".into()),

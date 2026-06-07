@@ -12,7 +12,8 @@ use crate::{
             find_runtime_services, print_runtime_summary, spawn_inbound_tasks,
             spawn_outbound_tasks, spawn_remote_service_tasks, RuntimeShared,
         },
-        runtime_status::{print_control_snapshot, print_status_snapshot},
+        runtime_mode::direct_port_forward_services,
+        runtime_status::{print_control_snapshot, print_status_snapshot, RuntimeConfigSummary},
     },
     crypto::wrapper::set_global_wrapper_config,
 };
@@ -43,19 +44,26 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         return Ok(());
     }
 
-    let shared =
-        RuntimeShared::new(prepared.exposed_service_labels.clone(), &config.data_dir).await;
+    let shared = RuntimeShared::new(
+        prepared.exposed_service_labels.clone(),
+        &config.data_dir,
+        RuntimeConfigSummary::from_app_config(&config),
+    )
+    .await;
     let (
         inbound_raw_service,
         outbound_socks5_service,
         outbound_http_proxy_service,
         outbound_shadowsocks_service,
+        outbound_trojan_service,
         outbound_egress_service,
         remote_port_forward_services,
     ) = find_runtime_services(&prepared.local_services, &prepared.remote_services);
 
-    let mut tasks: Vec<JoinHandle<()>> =
-        spawn_remote_service_tasks(&remote_port_forward_services).await?;
+    let mut tasks: Vec<JoinHandle<()>> = spawn_remote_service_tasks(
+        &direct_port_forward_services(&config.connects, &remote_port_forward_services),
+    )
+    .await?;
     tasks.extend(
         spawn_inbound_tasks(
             &config,
@@ -74,7 +82,9 @@ pub async fn run(config: AppConfig) -> Result<(), Error> {
         outbound_socks5_service,
         outbound_http_proxy_service,
         outbound_shadowsocks_service,
+        outbound_trojan_service,
         outbound_egress_service,
+        &remote_port_forward_services,
         &prepared.exposed_service_labels,
     ));
 

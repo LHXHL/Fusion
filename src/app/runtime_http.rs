@@ -20,6 +20,7 @@ use crate::{
             build_stream_close_frame, build_stream_data_frame, expect_stream_close_ack,
             write_next_stream_data_to_client,
         },
+        runtime_status::UpstreamPoolStatusMap,
         upstream_pool::{TcpMuxUpstreamPool, WsMuxUpstreamPool},
     },
     protocol::{
@@ -44,6 +45,7 @@ pub async fn run_outbound_http_once(
     registry: Arc<Mutex<AgentRegistry>>,
     conn_policy: ConnPolicy,
     proxy_chain: Vec<String>,
+    pool_status: UpstreamPoolStatusMap,
 ) -> Result<(), Error> {
     let http_service = match local_http_definition.kind {
         ServiceKind::LocalHttpProxy(service) => service,
@@ -58,7 +60,7 @@ pub async fn run_outbound_http_once(
     let listener = TcpListener::bind(http_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    let upstream_pool = TcpMuxUpstreamPool::new();
+    let upstream_pool = TcpMuxUpstreamPool::with_status(pool_status, "http");
     spawn_tcp_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!("service.local.active=http://{}", local_addr);
 
@@ -131,6 +133,7 @@ pub async fn run_outbound_http_ws_once(
     hub: Arc<Mutex<SessionHub>>,
     registry: Arc<Mutex<AgentRegistry>>,
     conn_policy: ConnPolicy,
+    pool_status: UpstreamPoolStatusMap,
 ) -> Result<(), Error> {
     let http_service = match local_http_definition.kind {
         ServiceKind::LocalHttpProxy(service) => service,
@@ -145,7 +148,7 @@ pub async fn run_outbound_http_ws_once(
     let listener = TcpListener::bind(http_service.bind_label()).await?;
     let local_addr = listener.local_addr()?;
     let allocator = StreamIdAllocator::new(1);
-    let upstream_pool = WsMuxUpstreamPool::new();
+    let upstream_pool = WsMuxUpstreamPool::with_status(pool_status, "http");
     spawn_ws_upstream_pool_maintenance(upstream_pool.clone(), hub.clone(), registry.clone());
     println!("service.local.active=http://{}", local_addr);
 

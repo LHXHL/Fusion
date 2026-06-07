@@ -11,6 +11,7 @@ use crate::{
         raw::RawService,
         shadowsocks::{ShadowsocksRequest, ShadowsocksService},
         socks5::{Socks5ConnectRequest, Socks5Service},
+        trojan::{TrojanRequest, TrojanService},
     },
 };
 
@@ -19,6 +20,7 @@ pub enum ServiceKind {
     LocalSocks5(Socks5Service),
     LocalHttpProxy(HttpProxyService),
     LocalShadowsocks(ShadowsocksService),
+    LocalTrojan(TrojanService),
     RemoteRaw(RawService),
     RemotePortForward(PortForwardService),
     Unsupported { scheme: String, original: String },
@@ -36,6 +38,7 @@ impl ServiceDefinition {
             "socks5" => ServiceKind::LocalSocks5(Socks5Service::from_url(&endpoint.url)?),
             "http" => ServiceKind::LocalHttpProxy(HttpProxyService::from_url(&endpoint.url)?),
             "ss" => ServiceKind::LocalShadowsocks(ShadowsocksService::from_url(&endpoint.url)?),
+            "trojan" => ServiceKind::LocalTrojan(TrojanService::from_url(&endpoint.url)?),
             other => ServiceKind::Unsupported {
                 scheme: other.to_string(),
                 original: endpoint.url.original.clone(),
@@ -67,14 +70,29 @@ impl ServiceDefinition {
     pub fn summary_line(&self) -> String {
         match &self.kind {
             ServiceKind::LocalSocks5(svc) => {
-                format!("service.local=socks5://{}{}", svc.bind_label(), svc.summary_suffix())
+                format!(
+                    "service.local=socks5://{}{}",
+                    svc.bind_label(),
+                    svc.summary_suffix()
+                )
             }
             ServiceKind::LocalHttpProxy(svc) => {
-                format!("service.local=http://{}{}", svc.bind_label(), svc.summary_suffix())
+                format!(
+                    "service.local=http://{}{}",
+                    svc.bind_label(),
+                    svc.summary_suffix()
+                )
             }
             ServiceKind::LocalShadowsocks(svc) => {
                 format!(
                     "service.local=ss://{}{}",
+                    svc.bind_label(),
+                    svc.summary_suffix()
+                )
+            }
+            ServiceKind::LocalTrojan(svc) => {
+                format!(
+                    "service.local=trojan://{}{}",
                     svc.bind_label(),
                     svc.summary_suffix()
                 )
@@ -117,6 +135,7 @@ pub fn validate_service_pairing(
             ServiceKind::LocalSocks5(_)
                 | ServiceKind::LocalHttpProxy(_)
                 | ServiceKind::LocalShadowsocks(_)
+                | ServiceKind::LocalTrojan(_)
         )
     });
     let has_supported_remote_egress = remote.iter().any(|s| {
@@ -129,7 +148,7 @@ pub fn validate_service_pairing(
     if has_local_stream_proxy && !has_supported_remote_egress {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "local socks5/http/ss service currently requires at least one remote raw/port service",
+            "local socks5/http/ss/trojan service currently requires at least one remote raw/port service",
         ));
     }
 
@@ -159,7 +178,8 @@ pub fn build_remote_stream_open(
         )),
         ServiceKind::LocalSocks5(_)
         | ServiceKind::LocalHttpProxy(_)
-        | ServiceKind::LocalShadowsocks(_) => Err(Error::new(
+        | ServiceKind::LocalShadowsocks(_)
+        | ServiceKind::LocalTrojan(_) => Err(Error::new(
             ErrorKind::InvalidInput,
             "cannot build remote stream open from local proxy service",
         )),
@@ -183,6 +203,13 @@ pub fn build_remote_stream_open_for_http_request(
 pub fn build_remote_stream_open_for_shadowsocks_request(
     definition: &ServiceDefinition,
     request: &ShadowsocksRequest,
+) -> Result<StreamOpenMessage, Error> {
+    build_remote_stream_open_for_target(definition, &request.target_host, request.target_port)
+}
+
+pub fn build_remote_stream_open_for_trojan_request(
+    definition: &ServiceDefinition,
+    request: &TrojanRequest,
 ) -> Result<StreamOpenMessage, Error> {
     build_remote_stream_open_for_target(definition, &request.target_host, request.target_port)
 }
@@ -215,7 +242,8 @@ pub fn build_remote_stream_open_for_target(
         )),
         ServiceKind::LocalSocks5(_)
         | ServiceKind::LocalHttpProxy(_)
-        | ServiceKind::LocalShadowsocks(_) => Err(Error::new(
+        | ServiceKind::LocalShadowsocks(_)
+        | ServiceKind::LocalTrojan(_) => Err(Error::new(
             ErrorKind::InvalidInput,
             "cannot build remote stream open from local proxy service",
         )),

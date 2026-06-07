@@ -3,6 +3,7 @@ use std::{collections::HashMap, time::SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    error::report_route_switched,
     protocol::{
         message::AgentAnnounceMessage,
         route::{RouteAnnouncement, RouteHop},
@@ -44,6 +45,8 @@ pub struct RegisteredRoute {
     #[serde(default)]
     pub selection_reason: String,
     pub learned_at_unix: u64,
+    #[serde(default)]
+    pub last_success_at_unix: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -118,6 +121,7 @@ impl AgentRegistry {
             learned_from: "direct_announce".to_string(),
             selection_reason: "new_destination".to_string(),
             learned_at_unix: unix_now(),
+            last_success_at_unix: None,
         });
     }
 
@@ -136,6 +140,7 @@ impl AgentRegistry {
             learned_from: "route_update".to_string(),
             selection_reason: "new_destination".to_string(),
             learned_at_unix: unix_now(),
+            last_success_at_unix: None,
         });
     }
 
@@ -143,6 +148,12 @@ impl AgentRegistry {
         self.routes
             .get(destination_agent_id)
             .map(|route| route.next_hop_agent_id.as_str())
+    }
+
+    pub fn mark_route_forward_success(&mut self, destination_agent_id: &str) {
+        if let Some(route) = self.routes.get_mut(destination_agent_id) {
+            route.last_success_at_unix = Some(unix_now());
+        }
     }
 
     pub fn prune_stale_routes(&mut self, max_age_secs: u64) -> usize {
@@ -336,8 +347,24 @@ impl AgentRegistry {
                         mut candidate,
                         selection_reason,
                     } => {
+                        if existing.next_hop_agent_id != candidate.next_hop_agent_id {
+                            report_route_switched(
+                                &destination,
+                                &existing.next_hop_agent_id,
+                                &candidate.next_hop_agent_id,
+                                selection_reason,
+                            );
+                        }
                         candidate.selection_reason = selection_reason.to_string();
-                        candidate.learned_at_unix = unix_now();
+                        if selection_reason == "same_next_hop_refresh" {
+                            candidate.learned_at_unix = existing.learned_at_unix;
+                            candidate.last_success_at_unix = existing.last_success_at_unix;
+                        } else {
+                            candidate.learned_at_unix = unix_now();
+                            candidate.last_success_at_unix = candidate
+                                .last_success_at_unix
+                                .or(existing.last_success_at_unix);
+                        }
                         self.routes.insert(destination, candidate);
                     }
                 }
@@ -368,6 +395,7 @@ where
     if candidate.next_hop_agent_id == existing.next_hop_agent_id {
         let mut refreshed = candidate.clone();
         refreshed.selection_reason = "same_next_hop_refresh".to_string();
+        refreshed.last_success_at_unix = existing.last_success_at_unix;
         return RouteUpdateDecision::Replace {
             candidate: refreshed,
             selection_reason: "same_next_hop_refresh",
@@ -398,6 +426,35 @@ where
     }
     if candidate.hop_count > existing.hop_count {
         return RouteUpdateDecision::KeepExisting;
+    }
+
+    match (
+        existing.last_success_at_unix,
+        candidate.last_success_at_unix,
+    ) {
+        (Some(existing_ts), Some(candidate_ts)) if candidate_ts > existing_ts => {
+            let mut replacement = candidate.clone();
+            replacement.selection_reason = "prefer_recent_success".to_string();
+            return RouteUpdateDecision::Replace {
+                candidate: replacement,
+                selection_reason: "prefer_recent_success",
+            };
+        }
+        (Some(existing_ts), Some(candidate_ts)) if existing_ts > candidate_ts => {
+            return RouteUpdateDecision::KeepExisting;
+        }
+        (None, Some(_)) => {
+            let mut replacement = candidate.clone();
+            replacement.selection_reason = "prefer_recent_success".to_string();
+            return RouteUpdateDecision::Replace {
+                candidate: replacement,
+                selection_reason: "prefer_recent_success",
+            };
+        }
+        (Some(_), None) => {
+            return RouteUpdateDecision::KeepExisting;
+        }
+        _ => {}
     }
 
     if candidate.next_hop_agent_id < existing.next_hop_agent_id {
@@ -686,7 +743,12 @@ mod tests {
         });
         assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
         assert_eq!(
-            registry.clone().routes.get("peer-z").unwrap().selection_reason,
+            registry
+                .clone()
+                .routes
+                .get("peer-z")
+                .unwrap()
+                .selection_reason,
             "stable_tie_break"
         );
 
@@ -812,5 +874,222 @@ mod tests {
             ],
         });
         assert_eq!(registry.next_hop_for("peer-z"), Some("peer-c"));
+    }
+
+    #[test]
+    fn registry_records_route_switch_in_recent_errors() {
+        use crate::error::{
+            clear_recent_errors_for_tests, recent_error_test_guard, recent_errors_snapshot,
+        };
+
+        let _guard = recent_error_test_guard();
+        clear_recent_errors_for_tests();
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-x".into(),
+                    agent_name: "peer-x-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-y".into(),
+                    agent_name: "peer-y-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-c".into(),
+                    agent_name: "peer-c-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-c"));
+        assert!(recent_errors_snapshot()
+            .iter()
+            .any(|entry| entry.code == "route.switched"));
+    }
+
+    #[test]
+    fn registry_prefers_recent_success_over_lex_tie_break() {
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        registry.mark_route_forward_success("peer-z");
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-a".into(),
+                    agent_name: "peer-a-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+    }
+
+    #[test]
+    fn registry_keeps_route_stable_on_equivalent_reannounce() {
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        let learned_at = registry
+            .clone()
+            .routes
+            .get("peer-z")
+            .unwrap()
+            .learned_at_unix;
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        let route = registry.clone().routes.get("peer-z").unwrap().clone();
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-b"));
+        assert_eq!(route.selection_reason, "same_next_hop_refresh");
+        assert_eq!(route.learned_at_unix, learned_at);
+    }
+
+    #[test]
+    fn registry_drops_stale_route_and_stops_forwarding() {
+        let mut registry = AgentRegistry::new();
+        registry.upsert_route_announcement(&RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        });
+        {
+            let stale = registry.routes.get_mut("peer-z").unwrap();
+            stale.learned_at_unix = stale.learned_at_unix.saturating_sub(3600);
+        }
+        registry.prune_stale_routes(60);
+        assert_eq!(registry.next_hop_for("peer-z"), None);
+    }
+
+    #[test]
+    fn registry_multi_exit_selection_stays_stable_on_alternating_announces() {
+        let mut registry = AgentRegistry::new();
+        let peer_a_route = RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-a".into(),
+                    agent_name: "peer-a-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        };
+        let peer_b_route = RouteAnnouncement {
+            origin_agent_id: "peer-z".into(),
+            origin_agent_name: "peer-z-name".into(),
+            capabilities: vec!["task:shell".into()],
+            services: vec!["task".into()],
+            path: vec![
+                RouteHop {
+                    agent_id: "peer-b".into(),
+                    agent_name: "peer-b-name".into(),
+                },
+                RouteHop {
+                    agent_id: "peer-z".into(),
+                    agent_name: "peer-z-name".into(),
+                },
+            ],
+        };
+
+        registry.upsert_route_announcement(&peer_b_route);
+        registry.upsert_route_announcement(&peer_a_route);
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-a"));
+
+        for _ in 0..4 {
+            registry.upsert_route_announcement(&peer_b_route);
+            registry.upsert_route_announcement(&peer_a_route);
+        }
+        assert_eq!(registry.next_hop_for("peer-z"), Some("peer-a"));
+        assert_eq!(
+            registry.routes.get("peer-z").unwrap().selection_reason,
+            "same_next_hop_refresh"
+        );
     }
 }

@@ -169,10 +169,10 @@ where
     let mut password = vec![0_u8; password_len];
     stream.read_exact(&mut password).await?;
 
-    let username =
-        String::from_utf8(username).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    let password =
-        String::from_utf8(password).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    let username = String::from_utf8(username)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+    let password = String::from_utf8(password)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
 
     let expected_username = service.username.as_deref().unwrap_or_default();
     let expected_password = service.password.as_deref().unwrap_or_default();
@@ -260,8 +260,7 @@ mod tests {
 
     use crate::{
         serve::socks5::{
-            accept_auth, read_connect_request, write_success_response, Socks5Address,
-            Socks5Service,
+            accept_auth, read_connect_request, write_success_response, Socks5Address, Socks5Service,
         },
         utils::url::ParsedUrl,
     };
@@ -287,8 +286,8 @@ mod tests {
     #[tokio::test]
     async fn socks5_no_auth_handshake_and_connect_request() {
         let (mut client, mut server) = duplex(128);
-        let service = Socks5Service::from_url(&ParsedUrl::parse("socks5://127.0.0.1:1080").unwrap())
-            .unwrap();
+        let service =
+            Socks5Service::from_url(&ParsedUrl::parse("socks5://127.0.0.1:1080").unwrap()).unwrap();
 
         let server_task = tokio::spawn(async move {
             accept_auth(&mut server, &service).await.unwrap();

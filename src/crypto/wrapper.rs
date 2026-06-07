@@ -11,6 +11,7 @@ use crate::crypto::{
     aead::{open, seal, EncMessage},
     transport::SharedKey,
 };
+use crate::error::{coded_io_error, ErrorCode};
 
 const ENCRYPTED_FRAME_MAGIC: &[u8] = b"FXE1";
 const COMPRESSED_FRAME_MAGIC: &[u8] = b"FXC1";
@@ -112,17 +113,27 @@ impl TransportWrapper for WrapperStage {
             WrapperStage::Padding { bytes } => wrap_padded(payload, *bytes),
             WrapperStage::SharedKeyAead(shared_key) => {
                 let sealed = seal(&payload, shared_key.as_bytes()).map_err(|err| {
-                    Error::new(
+                    coded_io_error(
                         ErrorKind::InvalidData,
-                        format!("failed to encrypt transport frame: {err}"),
+                        ErrorCode::WrapperEncryptFailed,
+                        "failed to encrypt transport frame",
+                        false,
+                        Some(err.to_string()),
                     )
                 })?;
                 let envelope = SealedPayload {
                     nonce: sealed.nonce,
                     ciphertext: sealed.ciphertext,
                 };
-                let body = serde_json::to_vec(&envelope)
-                    .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+                let body = serde_json::to_vec(&envelope).map_err(|err| {
+                    coded_io_error(
+                        ErrorKind::InvalidData,
+                        ErrorCode::WrapperEnvelopeDecodeFailed,
+                        "failed to encode encrypted transport envelope",
+                        false,
+                        Some(err.to_string()),
+                    )
+                })?;
                 let mut out = Vec::with_capacity(ENCRYPTED_FRAME_MAGIC.len() + body.len());
                 out.extend_from_slice(ENCRYPTED_FRAME_MAGIC);
                 out.extend_from_slice(&body);
@@ -137,18 +148,24 @@ impl TransportWrapper for WrapperStage {
             WrapperStage::Padding { .. } => unwrap_padded(payload),
             WrapperStage::SharedKeyAead(shared_key) => {
                 if !payload.starts_with(ENCRYPTED_FRAME_MAGIC) {
-                    return Err(Error::new(
+                    return Err(coded_io_error(
                         ErrorKind::PermissionDenied,
+                        ErrorCode::WrapperMissingEncryption,
                         "received unencrypted transport frame but local key is configured",
+                        false,
+                        Some("configure the same shared key on both peers".to_string()),
                     ));
                 }
                 let envelope: SealedPayload = serde_json::from_slice(
                     &payload[ENCRYPTED_FRAME_MAGIC.len()..],
                 )
                 .map_err(|err| {
-                    Error::new(
+                    coded_io_error(
                         ErrorKind::InvalidData,
-                        format!("failed to decode encrypted transport envelope: {err}"),
+                        ErrorCode::WrapperEnvelopeDecodeFailed,
+                        "failed to decode encrypted transport envelope",
+                        false,
+                        Some(err.to_string()),
                     )
                 })?;
                 open(
@@ -159,9 +176,14 @@ impl TransportWrapper for WrapperStage {
                     shared_key.as_bytes(),
                 )
                 .map_err(|err| {
-                    Error::new(
+                    coded_io_error(
                         ErrorKind::PermissionDenied,
-                        format!("failed to decrypt transport frame: {err}"),
+                        ErrorCode::WrapperDecryptFailed,
+                        "failed to decrypt transport frame",
+                        false,
+                        Some(format!(
+                            "{err}; verify that both peers use the same shared key and wrapper settings"
+                        )),
                     )
                 })
             }
@@ -171,12 +193,24 @@ impl TransportWrapper for WrapperStage {
 
 fn wrap_compressed(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder
-        .write_all(&payload)
-        .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
-    let body = encoder
-        .finish()
-        .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+    encoder.write_all(&payload).map_err(|err| {
+        coded_io_error(
+            ErrorKind::InvalidData,
+            ErrorCode::WrapperCompressionFailed,
+            "failed to write payload into compression wrapper",
+            false,
+            Some(err.to_string()),
+        )
+    })?;
+    let body = encoder.finish().map_err(|err| {
+        coded_io_error(
+            ErrorKind::InvalidData,
+            ErrorCode::WrapperCompressionFailed,
+            "failed to finish compression wrapper",
+            false,
+            Some(err.to_string()),
+        )
+    })?;
     let mut out = Vec::with_capacity(COMPRESSED_FRAME_MAGIC.len() + body.len());
     out.extend_from_slice(COMPRESSED_FRAME_MAGIC);
     out.extend_from_slice(&body);
@@ -185,24 +219,36 @@ fn wrap_compressed(payload: Vec<u8>) -> Result<Vec<u8>, Error> {
 
 fn unwrap_compressed(payload: &[u8]) -> Result<Vec<u8>, Error> {
     if !payload.starts_with(COMPRESSED_FRAME_MAGIC) {
-        return Err(Error::new(
+        return Err(coded_io_error(
             ErrorKind::PermissionDenied,
+            ErrorCode::WrapperMissingCompression,
             "received uncompressed transport frame but compression wrapper is configured",
+            false,
+            Some("configure compression consistently on both peers".to_string()),
         ));
     }
     let mut decoder = ZlibDecoder::new(Cursor::new(&payload[COMPRESSED_FRAME_MAGIC.len()..]));
     let mut out = Vec::new();
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+    decoder.read_to_end(&mut out).map_err(|err| {
+        coded_io_error(
+            ErrorKind::InvalidData,
+            ErrorCode::WrapperCompressionFailed,
+            "failed to decode compressed transport frame",
+            false,
+            Some(err.to_string()),
+        )
+    })?;
     Ok(out)
 }
 
 fn wrap_padded(payload: Vec<u8>, bytes: usize) -> Result<Vec<u8>, Error> {
     let original_len = u32::try_from(payload.len()).map_err(|_| {
-        Error::new(
+        coded_io_error(
             ErrorKind::InvalidInput,
+            ErrorCode::WrapperPaddingTooLarge,
             "payload is too large for padding wrapper header",
+            false,
+            None,
         )
     })?;
     let mut out = Vec::with_capacity(PADDED_FRAME_MAGIC.len() + 4 + payload.len() + bytes);
@@ -219,15 +265,21 @@ fn wrap_padded(payload: Vec<u8>, bytes: usize) -> Result<Vec<u8>, Error> {
 
 fn unwrap_padded(payload: &[u8]) -> Result<Vec<u8>, Error> {
     if !payload.starts_with(PADDED_FRAME_MAGIC) {
-        return Err(Error::new(
+        return Err(coded_io_error(
             ErrorKind::PermissionDenied,
+            ErrorCode::WrapperMissingPadding,
             "received unpadded transport frame but padding wrapper is configured",
+            false,
+            Some("configure padding consistently on both peers".to_string()),
         ));
     }
     if payload.len() < PADDED_FRAME_MAGIC.len() + 4 {
-        return Err(Error::new(
+        return Err(coded_io_error(
             ErrorKind::InvalidData,
+            ErrorCode::WrapperPaddingTruncated,
             "padding wrapper header is truncated",
+            false,
+            None,
         ));
     }
     let mut len_buf = [0_u8; 4];
@@ -235,9 +287,15 @@ fn unwrap_padded(payload: &[u8]) -> Result<Vec<u8>, Error> {
     let original_len = u32::from_le_bytes(len_buf) as usize;
     let body = &payload[PADDED_FRAME_MAGIC.len() + 4..];
     if body.len() < original_len {
-        return Err(Error::new(
+        return Err(coded_io_error(
             ErrorKind::InvalidData,
+            ErrorCode::WrapperPaddingLengthInvalid,
             "padding wrapper body is shorter than declared original length",
+            false,
+            Some(format!(
+                "declared_original_len={original_len} actual_body_len={}",
+                body.len()
+            )),
         ));
     }
     Ok(body[..original_len].to_vec())
@@ -279,7 +337,8 @@ mod tests {
     fn shared_key_pipeline_rejects_plain_payload() {
         let key = SharedKey::from_secret("fusion-secret");
         let pipeline = WrapperPipeline::from_shared_key(Some(&key));
-        assert!(pipeline.unwrap(b"plain-frame").is_err());
+        let err = pipeline.unwrap(b"plain-frame").err().unwrap();
+        assert!(err.to_string().contains("code=wrapper.missing_encryption"));
     }
 
     #[test]
@@ -330,5 +389,31 @@ mod tests {
         assert!(payload_looks_wrapped(&wrapped));
         let unwrapped = pipeline.unwrap(&wrapped).unwrap();
         assert_eq!(unwrapped, payload);
+    }
+
+    #[test]
+    fn compression_pipeline_reports_mismatch_code() {
+        let pipeline = WrapperPipeline::from_config(
+            &WrapperConfig {
+                compress: true,
+                padding: None,
+            },
+            None,
+        );
+        let err = pipeline.unwrap(b"plain-frame").err().unwrap();
+        assert!(err.to_string().contains("code=wrapper.missing_compression"));
+    }
+
+    #[test]
+    fn padding_pipeline_reports_truncated_header_code() {
+        let pipeline = WrapperPipeline::from_config(
+            &WrapperConfig {
+                compress: false,
+                padding: Some(32),
+            },
+            None,
+        );
+        let err = pipeline.unwrap(b"FXP1").err().unwrap();
+        assert!(err.to_string().contains("code=wrapper.padding_truncated"));
     }
 }

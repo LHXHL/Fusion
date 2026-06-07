@@ -228,4 +228,62 @@ mod tests {
         server.await.unwrap();
         let _ = fs::remove_dir_all(root).await;
     }
+
+    #[tokio::test]
+    async fn simplex_oss_mux_buffers_stream_frames_until_receiver_is_opened() {
+        let root = std::env::temp_dir().join(format!(
+            "fusion-simplex-oss-mux-buffer-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let endpoint = format!("simplex+oss://mesh-buffer/channel?root={}", root.display());
+        let server_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("simplex-oss-mux-buffer-server".into()),
+            key: None,
+        });
+        let client_identity = AgentIdentity::from_config(&AgentIdentityConfig {
+            name: Some("simplex-oss-mux-buffer-client".into()),
+            key: None,
+        });
+
+        let endpoint_for_server = endpoint.clone();
+        let server = tokio::spawn(async move {
+            let peer = accept_mux_peer_on(server_identity, &endpoint_for_server)
+                .await
+                .unwrap();
+            let (stream_id, open) = peer.read_stream_open().await.unwrap();
+            assert_eq!(stream_id, 7);
+            assert_eq!(open.target_host.as_deref(), Some("buffer.test"));
+            let mut rx = peer.open_stream_receiver(stream_id).await;
+            rx.recv().await.unwrap()
+        });
+
+        let peer = connect_mux_peer(client_identity, &endpoint).await.unwrap();
+        let open = Frame::new(
+            MessageType::StreamOpen,
+            Some(peer.session.local.agent_id.clone()),
+            Some(peer.session.remote.agent_id.clone()),
+            Message::StreamOpen(crate::protocol::message::StreamOpenMessage {
+                service: "raw".into(),
+                target_host: Some("buffer.test".into()),
+                target_port: Some(443),
+            }),
+        )
+        .with_stream_id(7);
+        let data = Frame::new(
+            MessageType::StreamData,
+            Some(peer.session.local.agent_id.clone()),
+            Some(peer.session.remote.agent_id.clone()),
+            Message::StreamData(StreamDataMessage::from_bytes(b"buffered")),
+        )
+        .with_stream_id(7);
+        peer.send_frame(&open).await.unwrap();
+        peer.send_frame(&data).await.unwrap();
+
+        let frame = server.await.unwrap();
+        match frame.message {
+            Message::StreamData(d) => assert_eq!(d.to_bytes().unwrap(), b"buffered"),
+            other => panic!("unexpected frame: {:?}", other),
+        }
+        let _ = fs::remove_dir_all(root).await;
+    }
 }

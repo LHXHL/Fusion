@@ -1,4 +1,8 @@
 pub mod dialer;
+pub mod dns_tunnel;
+pub mod h2_mux;
+pub mod h2_tunnel;
+pub mod http_poll;
 pub mod listener;
 pub mod memory;
 pub mod proxy;
@@ -9,6 +13,7 @@ pub mod simplex_http;
 pub mod simplex_http_mux;
 pub mod simplex_oss;
 pub mod simplex_oss_mux;
+pub mod streamhttp;
 pub mod tcp;
 pub mod tcp_mux;
 pub mod tls;

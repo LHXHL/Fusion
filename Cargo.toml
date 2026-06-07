@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/fusion-logic"]
+resolver = "2"
+
 [package]
 name = "fusion"
 version = "0.1.0"
@@ -7,6 +11,10 @@ edition = "2021"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
+fusion-logic = { path = "crates/fusion-logic" }
+h2 = "0.4.12"
+bytes = "1.10.1"
+http = "1.3.1"
 aes-gcm-siv = "0.11.1"
 chrono = "0.4.39"
 clap = { version = "4.4.8", features = ["derive"] }
